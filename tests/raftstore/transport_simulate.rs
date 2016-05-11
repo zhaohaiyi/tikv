@@ -13,7 +13,7 @@
 
 use kvproto::raft_serverpb::RaftMessage;
 use tikv::raftstore::{Result, Error};
-use tikv::raftstore::store::Transport;
+use tikv::raftstore::store::{Transport, SendCh};
 use rand;
 use std::sync::{Arc, RwLock};
 
@@ -100,7 +100,7 @@ impl<T: Transport> SimulateTransport<T> {
 }
 
 impl<T: Transport> Transport for SimulateTransport<T> {
-    fn send(&self, msg: RaftMessage) -> Result<()> {
+    fn send(&self, msg: RaftMessage, ch: SendCh) -> Result<()> {
         let mut discard = false;
         for strategy in &self.filters {
             if strategy.wl().before(&msg) {
@@ -110,7 +110,7 @@ impl<T: Transport> Transport for SimulateTransport<T> {
 
         let mut res = Ok(());
         if !discard {
-            res = self.trans.rl().send(msg);
+            res = self.trans.rl().send(msg, ch);
         }
 
         for strategy in self.filters.iter().rev() {

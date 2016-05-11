@@ -28,6 +28,7 @@ use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, ChangePeerRequest, Cm
 use kvproto::raft_serverpb::{RaftMessage, RaftTruncatedState};
 use raft::{self, RawNode, StateRole};
 use raftstore::{Result, Error};
+use raftstore::store::SendCh;
 use raftstore::coprocessor::CoprocessorHost;
 use raftstore::coprocessor::split_observer::SplitObserver;
 use util::{escape, HandyRwLock};
@@ -128,6 +129,8 @@ pub struct Peer {
     // if we remove ourself in ChangePeer remove, we should set this flag, then
     // any following committed logs in same Ready should be applied failed.
     penging_remove: bool,
+
+    sendch: SendCh,
 }
 
 impl Peer {
@@ -212,6 +215,7 @@ impl Peer {
             coprocessor_host: CoprocessorHost::new(),
             size_diff_hint: 0,
             penging_remove: false,
+            sendch: store.get_sendch(),
         };
 
         peer.load_all_coprocessors();
@@ -455,7 +459,7 @@ impl Peer {
                from_store_id,
                to_store_id);
 
-        if let Err(e) = trans.rl().send(send_msg) {
+        if let Err(e) = trans.rl().send(send_msg, self.sendch.clone()) {
             warn!("failed to send msg from {} to {} for region {}, err: {:?}",
                   from_store_id,
                   to_store_id,

@@ -25,6 +25,7 @@ use tikv::raftstore::store::{Transport, msg};
 use kvproto::raft_cmdpb::*;
 use kvproto::raft_serverpb;
 use tikv::raftstore::Result;
+use tikv::raftstore::store::SendCh;
 use tikv::util::HandyRwLock;
 use tikv::server::Config as ServerConfig;
 use tikv::server::transport::{ServerRaftStoreRouter, RaftStoreRouter};
@@ -40,16 +41,20 @@ impl ChannelTransport {
     pub fn new() -> Arc<RwLock<ChannelTransport>> {
         Arc::new(RwLock::new(ChannelTransport { routers: HashMap::new() }))
     }
-}
 
-impl Transport for ChannelTransport {
-    fn send(&self, msg: raft_serverpb::RaftMessage) -> Result<()> {
+    pub fn send_raft_msg(&self, msg: raft_serverpb::RaftMessage) -> Result<()> {
         let to_store = msg.get_message().get_to();
 
         match self.routers.get(&to_store) {
             Some(h) => h.rl().send_raft_msg(msg),
             _ => Err(box_err!("missing sender for store {}", to_store)),
         }
+    }
+}
+
+impl Transport for ChannelTransport {
+    fn send(&self, msg: raft_serverpb::RaftMessage, _: SendCh) -> Result<()> {
+        self.send_raft_msg(msg)
     }
 }
 
@@ -125,7 +130,7 @@ impl Simulator for NodeCluster {
     }
 
     fn send_raft_msg(&self, msg: raft_serverpb::RaftMessage) -> Result<()> {
-        self.trans.rl().send(msg)
+        self.trans.rl().send_raft_msg(msg)
     }
 
     fn hook_transport(&self, node_id: u64, filters: Vec<RwLock<Box<Filter>>>) {

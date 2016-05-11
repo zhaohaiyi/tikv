@@ -148,7 +148,7 @@ mod tests {
         let listener = TcpListener::bind(&addr).unwrap();
 
         let addr = listener.local_addr().unwrap();
-        let url: Url = format!("http://{}/v1/msg", addr).parse().unwrap();
+        let url: Url = format!("http://{}{}", addr, V1_MSG_PATH).parse().unwrap();
 
         let mut s = Server::new(TestServerHandler);
         let listening = s.run(listener).unwrap();

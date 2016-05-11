@@ -112,7 +112,7 @@ impl ServerTransport {
 }
 
 impl Transport for ServerTransport {
-    fn send(&self, msg: RaftMessage) -> RaftStoreResult<()> {
+    fn send(&self, msg: RaftMessage, _: SendCh) -> RaftStoreResult<()> {
         let to_store_id = msg.get_message().get_to();
 
         let mut req = Message::new();

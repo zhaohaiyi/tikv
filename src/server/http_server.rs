@@ -32,11 +32,11 @@ use super::http::{Body, OnResponseResult, OnResponse};
 
 const HTTP_CONN_IDLE_TIMEOUT_MS: u64 = 30000;
 
-pub trait ServerHandler: Send + Sync {
-    fn on_request(&mut self, msg: msgpb::Message, cb: OnResponse);
+pub trait ServerHandler: Send {
+    fn on_request(&mut self, mut msg: msgpb::Message, cb: OnResponse);
 }
 
-pub const V1_MSG_PATH: &'static str = "/v1/msg";
+pub const V1_MSG_PATH: &'static str = "/api/v1/msg";
 
 #[derive(Debug)]
 enum Route {
@@ -145,6 +145,7 @@ impl<T: ServerHandler, H: HyperTransport> HyperHandler<H> for Handler<T> {
                                      error!("set response writable to WRITE failed {:?}", e);
                                  }
                              });
+
                 Next::wait()
             }
             _ => unreachable!(),

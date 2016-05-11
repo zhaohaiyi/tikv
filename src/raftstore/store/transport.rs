@@ -14,8 +14,10 @@
 use kvproto::raft_serverpb::RaftMessage;
 
 use raftstore::Result;
+use raftstore::store::SendCh;
 
 // Transports message between different raft peers.
 pub trait Transport: Send + Sync {
-    fn send(&self, msg: RaftMessage) -> Result<()>;
+    // TODO: Add ch for HTTP transport now, I will refactor this later.
+    fn send(&self, msg: RaftMessage, ch: SendCh) -> Result<()>;
 }
