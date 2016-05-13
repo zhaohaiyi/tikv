@@ -162,7 +162,7 @@ mod tests {
         // util::init_log(util::LogLevelFilter::Debug).unwrap();
 
         let mut s = Server::new(TestServerHandler);
-        let listening = s.http(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let listening = s.http("127.0.0.1:0".parse().unwrap()).unwrap();
 
         let addr = listening.addr;
         let url: Url = format!("http://{}{}", addr, V1_MSG_PATH).parse().unwrap();
@@ -170,7 +170,7 @@ mod tests {
         let mut msg = Message::new();
         msg.set_msg_type(MessageType::Raft);
 
-        let c = Client::new().unwrap();
+        let c = Arc::new(Client::new().unwrap());
         for _ in 0..2 {
             let (tx, rx) = mpsc::channel();
             c.post_message(url.clone(),
@@ -199,9 +199,6 @@ mod tests {
         } else {
             assert!(false, format!("must invalid http response, but {:?}", res));
         }
-
-
-        c.close();
 
         listening.close();
     }
@@ -256,12 +253,12 @@ mod tests {
     fn test_http_transport() {
         let (tx, rx) = mpsc::channel();
         let mut s = Server::new(TestTransportServerHandler { tx: tx });
-        let listening = s.http(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let listening = s.http("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = listening.addr;
 
         let peeker = TestStoreAddrPeeker { addr: format!("http://{}", addr) };
 
-        let client = Client::new().unwrap();
+        let client = Arc::new(Client::new().unwrap());
         let router = Arc::new(RwLock::new(TestRaftStoreRouter {
             unreachable_cnt: AtomicUsize::new(0),
         }));
@@ -282,7 +279,6 @@ mod tests {
 
         thread::sleep(Duration::from_millis(200));
 
-        client.close();
         listening.close();
 
         assert_eq!(router.rl().unreachable_cnt.load(Ordering::SeqCst), num / 2);

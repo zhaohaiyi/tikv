@@ -110,7 +110,7 @@ impl StorePending {
 }
 
 struct Worker<A: StoreAddrPeeker, R: RaftStoreRouter + 'static> {
-    client: Client,
+    client: Arc<Client>,
 
     raft_router: Arc<RwLock<R>>,
     store_peeker: A,
@@ -125,7 +125,7 @@ impl<A, R> Worker<A, R>
     where A: StoreAddrPeeker,
           R: RaftStoreRouter
 {
-    pub fn new(client: Client, peeker: A, router: Arc<RwLock<R>>) -> Worker<A, R> {
+    pub fn new(client: Arc<Client>, peeker: A, router: Arc<RwLock<R>>) -> Worker<A, R> {
         let (tx, rx) = mpsc::channel();
         Worker {
             client: client,
@@ -281,7 +281,10 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
-    pub fn new<A, R>(client: Client, peeker: A, router: Arc<RwLock<R>>) -> Result<HttpTransport>
+    pub fn new<A, R>(client: Arc<Client>,
+                     peeker: A,
+                     router: Arc<RwLock<R>>)
+                     -> Result<HttpTransport>
         where A: StoreAddrPeeker + 'static,
               R: RaftStoreRouter + 'static
     {

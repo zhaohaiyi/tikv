@@ -20,17 +20,18 @@ use rocksdb::DB;
 use pd::{INVALID_ID, PdClient, Error as PdError};
 use kvproto::raft_serverpb::StoreIdent;
 use kvproto::metapb;
-use raftstore::store::{self, Msg, Store, Config as StoreConfig, keys, Peekable, Transport, SendCh};
+use raftstore::store::{self, Msg, Store, keys, Peekable, Transport, SendCh};
 use super::Result;
 use util::HandyRwLock;
 use super::config::Config;
 use storage::{Storage, RaftKv};
 use super::transport::ServerRaftStoreRouter;
+use super::http_client::Url;
 
-pub fn create_raft_storage<C>(node: Node<C>, db: Arc<DB>) -> Result<Storage>
-    where C: PdClient + 'static
-{
-    let engine = box RaftKv::new(node, db);
+pub fn create_raft_storage(router: Arc<RwLock<ServerRaftStoreRouter>>,
+                           db: Arc<DB>)
+                           -> Result<Storage> {
+    let engine = box RaftKv::new(router, db);
     let store = try!(Storage::from_engine(engine));
     Ok(store)
 }
@@ -40,7 +41,6 @@ pub fn create_raft_storage<C>(node: Node<C>, db: Arc<DB>) -> Result<Storage>
 pub struct Node<C: PdClient + 'static> {
     cluster_id: u64,
     store: metapb::Store,
-    store_cfg: StoreConfig,
     store_handle: Option<thread::JoinHandle<()>>,
     ch: SendCh,
 
@@ -53,25 +53,19 @@ impl<C> Node<C>
     where C: PdClient
 {
     pub fn new<T>(event_loop: &mut EventLoop<Store<T, C>>,
-                  cfg: &Config,
+                  cluster_id: u64,
                   pd_client: Arc<RwLock<C>>)
                   -> Node<C>
         where T: Transport + 'static
     {
         let mut store = metapb::Store::new();
         store.set_id(INVALID_ID);
-        if cfg.advertise_addr.is_empty() {
-            store.set_address(cfg.addr.clone());
-        } else {
-            store.set_address(cfg.advertise_addr.clone())
-        }
 
         let ch = SendCh::new(event_loop.channel());
         let router = Arc::new(RwLock::new(ServerRaftStoreRouter::new(ch.clone())));
         Node {
-            cluster_id: cfg.cluster_id,
+            cluster_id: cluster_id,
             store: store,
-            store_cfg: cfg.store_cfg.clone(),
             store_handle: None,
             pd_client: pd_client,
             ch: ch,
@@ -79,8 +73,30 @@ impl<C> Node<C>
         }
     }
 
+    pub fn set_advertise_addr(&mut self, cfg: &Config) {
+        // We doesn't know exact listening address before in test.
+        let mut addr = if cfg.advertise_addr.is_empty() {
+            cfg.addr.clone()
+        } else {
+            cfg.advertise_addr.clone()
+        };
+
+        if !addr.starts_with("http://") && !addr.starts_with("https://") {
+            warn!("URL {} misses scheme, use default", addr);
+            // TODO: check whether http or https, if we have SSL configuration,
+            // use https.
+            addr = format!("http://{}", addr)
+        }
+
+        // Here must be the valid url format.
+        let url = Url::parse(&addr).expect("must have a valid URL format for advertise addr");
+
+        self.store.set_address(url.into_string());
+    }
+
     pub fn start<T>(&mut self,
                     event_loop: EventLoop<Store<T, C>>,
+                    cfg: &Config,
                     engine: Arc<DB>,
                     trans: Arc<RwLock<T>>)
                     -> Result<()>
@@ -110,7 +126,7 @@ impl<C> Node<C>
         }
 
         // inform pd.
-        try!(self.start_store(event_loop, store_id, engine, trans));
+        try!(self.start_store(event_loop, cfg, store_id, engine, trans));
         try!(self.pd_client
                  .write()
                  .unwrap()
@@ -201,6 +217,7 @@ impl<C> Node<C>
 
     fn start_store<T>(&mut self,
                       mut event_loop: EventLoop<Store<T, C>>,
+                      cfg: &Config,
                       store_id: u64,
                       engine: Arc<DB>,
                       trans: Arc<RwLock<T>>)
@@ -214,7 +231,7 @@ impl<C> Node<C>
             return Err(box_err!("{} is already started", store_id));
         }
 
-        let cfg = self.store_cfg.clone();
+        let cfg = cfg.store_cfg.clone();
         let pd_client = self.pd_client.clone();
         let mut store = try!(Store::new(&mut event_loop,
                                         meta,

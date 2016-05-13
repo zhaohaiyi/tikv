@@ -22,10 +22,11 @@ use uuid::Uuid;
 use protobuf::Message;
 use hyper::{Next, Encoder, Decoder, Control};
 use hyper::method::Method::{Post, Put};
-use hyper::server::{Server as HyperServer, Handler as HyperHandler, Request, Response, Listening};
+use hyper::server::{Server as HyperServer, Handler as HyperHandler, Request, Response};
 use hyper::net::Transport as HyperTransport;
 use hyper::{RequestUri, StatusCode};
 use hyper::header::ContentLength;
+pub use hyper::server::Listening;
 
 use kvproto::msgpb;
 use super::Result;
@@ -245,9 +246,9 @@ impl<T: ServerHandler> Server<T> {
 }
 
 impl<T: ServerHandler> Server<T> {
-    pub fn http(&mut self, addr: &SocketAddr) -> Result<Listening> {
+    pub fn http(&mut self, addr: SocketAddr) -> Result<Listening> {
         // TODO: support HTTPS later.
-        let s = try!(HyperServer::http(addr));
+        let s = try!(HyperServer::http(&addr));
         let s = s.keep_alive(true)
                  .idle_timeout(Duration::from_millis(HTTP_CONN_IDLE_TIMEOUT_MS));
 

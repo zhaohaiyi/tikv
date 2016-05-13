@@ -117,11 +117,13 @@ fn build_raftkv(matches: &Matches,
                                           |v| v.as_str().map(|s| s.to_owned()));
 
     let mut event_loop = store::create_event_loop(&cfg.store_cfg).unwrap();
-    let mut node = Node::new(&mut event_loop, &cfg, pd_client);
-    node.start(event_loop, engine.clone(), trans).unwrap();
+    let mut node = Node::new(&mut event_loop, cfg.cluster_id, pd_client);
+
+    node.set_advertise_addr(&cfg);
+    node.start(event_loop, &cfg, engine.clone(), trans).unwrap();
     let raft_router = node.raft_store_router();
 
-    (create_raft_storage(node, engine).unwrap(), raft_router)
+    (create_raft_storage(raft_router.clone(), engine).unwrap(), raft_router)
 }
 
 fn get_store_path(matches: &Matches, config: &toml::Value) -> String {

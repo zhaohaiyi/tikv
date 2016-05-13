@@ -27,9 +27,12 @@ pub struct Config {
 
     // Server advertise listening address for outer communication.
     // If not set, we will use listening address instead.
+    // The correct format for advertise_addr is http://host:port or
+    // https://host:port, if only host:port supplied, a default scheme
+    // http or https if we use SSL will be added.
     pub advertise_addr: String,
 
-    pub store_cfg: StoreConfig,
+    pub store_cfg: StoreConfig, // TODO: add SSL configuration later.
 }
 
 impl Default for Config {
@@ -48,9 +51,8 @@ impl Config {
         Config::default()
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
         try!(self.store_cfg.validate());
-
         Ok(())
     }
 }

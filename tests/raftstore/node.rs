@@ -87,9 +87,9 @@ impl Simulator for NodeCluster {
         let mut event_loop = store::create_event_loop(&cfg.store_cfg).unwrap();
         let simulate_trans = SimulateTransport::new(strategy, self.trans.clone());
         let trans = Arc::new(RwLock::new(simulate_trans));
-        let mut node = Node::new(&mut event_loop, &cfg, self.pd_client.clone());
+        let mut node = Node::new(&mut event_loop, cfg.cluster_id, self.pd_client.clone());
 
-        node.start(event_loop, engine, trans.clone()).unwrap();
+        node.start(event_loop, &cfg, engine, trans.clone()).unwrap();
         assert!(node_id == 0 || node_id == node.id());
 
         let node_id = node.id();

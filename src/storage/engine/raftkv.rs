@@ -13,7 +13,6 @@
 
 #![allow(dead_code)]
 
-use server::Node;
 use server::transport::{ServerRaftStoreRouter, RaftStoreRouter};
 use raftstore::store::Peekable;
 use raftstore::errors::Error as RaftServerError;
@@ -24,7 +23,6 @@ use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse, RaftRequestHeader, Re
 use kvproto::errorpb;
 use kvproto::kvrpcpb::Context;
 
-use pd::PdClient;
 use uuid::Uuid;
 use std::sync::{Arc, RwLock};
 use std::fmt::{self, Formatter, Debug};
@@ -86,18 +84,14 @@ impl From<Error> for engine::Error {
 }
 
 /// RaftKv is a storage engine base on RaftKvServer.
-pub struct RaftKv<C: PdClient + 'static> {
-    node: Node<C>,
+pub struct RaftKv {
     db: Arc<DB>,
     router: Arc<RwLock<ServerRaftStoreRouter>>,
 }
 
-impl<C: PdClient> RaftKv<C> {
-    /// Create a RaftKv using specified configuration.
-    pub fn new(node: Node<C>, db: Arc<DB>) -> RaftKv<C> {
-        let router = node.raft_store_router();
+impl RaftKv {
+    pub fn new(router: Arc<RwLock<ServerRaftStoreRouter>>, db: Arc<DB>) -> RaftKv {
         RaftKv {
-            node: node,
             db: db,
             router: router,
         }
@@ -176,13 +170,13 @@ fn invalid_resp_type(exp: CmdType, act: CmdType) -> engine::Error {
     Error::InvalidResponse(format!("cmd type not match, want {:?}, got {:?}!", exp, act)).into()
 }
 
-impl<C: PdClient> Debug for RaftKv<C> {
+impl Debug for RaftKv {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "RaftKv")
     }
 }
 
-impl<C: PdClient> Engine for RaftKv<C> {
+impl Engine for RaftKv {
     fn get(&self, ctx: &Context, key: &Key) -> engine::Result<Option<Value>> {
         let snap = self.snapshot(ctx).unwrap();
         snap.get(key)

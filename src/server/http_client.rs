@@ -13,6 +13,7 @@
 
 use std::fmt::{self, Formatter, Debug};
 use std::time::Duration;
+use std::sync::Mutex;
 
 use uuid::Uuid;
 use hyper::client::{Request, Response, Handler as HyperHandler, HttpConnector};
@@ -232,7 +233,7 @@ impl<H: HyperTransport> HyperHandler<H> for Handler {
 }
 
 pub struct Client {
-    c: HyperClient<Handler>,
+    c: Mutex<Option<HyperClient<Handler>>>,
 }
 
 impl Client {
@@ -243,15 +244,11 @@ impl Client {
                          .keep_alive(true)
                          .build());
 
-        Ok(Client { c: c })
-    }
-
-    pub fn close(self) {
-        self.c.close()
+        Ok(Client { c: Mutex::new(Some(c)) })
     }
 
     fn request(&self, url: Url, h: Handler) -> Result<()> {
-        if let Err(e) = self.c.request(url, h) {
+        if let Err(e) = self.c.lock().unwrap().as_ref().unwrap().request(url, h) {
             return Err(box_err!("request failed {}", e));
         }
         Ok(())
@@ -286,8 +283,9 @@ impl Client {
     }
 }
 
-impl Clone for Client {
-    fn clone(&self) -> Client {
-        Client { c: self.c.clone() }
+impl Drop for Client {
+    fn drop(&mut self) {
+        let c = self.c.lock().unwrap().take().unwrap();
+        c.close();
     }
 }
