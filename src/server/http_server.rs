@@ -172,6 +172,8 @@ impl<T: ServerHandler, H: HyperTransport> HyperHandler<H> for Handler<T> {
     fn on_response(&mut self, response: &mut Response) -> Next {
         debug!("{} on response for route {:?}", self.tag, self.route);
 
+        response.headers_mut().set(ContentLength(0));
+
         match self.route {
             Route::Invalid { code } => {
                 response.set_status(code);
