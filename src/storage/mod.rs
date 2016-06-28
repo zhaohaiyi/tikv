@@ -190,7 +190,7 @@ impl Storage {
                 let msg = try!(rx.recv());
                 debug!("recv message: {:?}", msg);
                 match msg {
-                    Message::Command(cmd) => scheduler.handle_cmd(cmd),
+                    Message::Command(cmd) => scheduler.dispatch_cmd(cmd),
                     Message::Close => break,
                 }
             }
