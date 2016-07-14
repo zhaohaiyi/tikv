@@ -50,6 +50,7 @@ impl<'a> SnapshotStore<'a> {
         let cursor = try!(self.snapshot.iter());
         Ok(StoreScanner {
             cursor: cursor,
+            snapshot: MvccSnapshot::new(self.snapshot, self.start_ts),
             start_ts: self.start_ts,
         })
     }
@@ -57,6 +58,7 @@ impl<'a> SnapshotStore<'a> {
 
 pub struct StoreScanner<'a> {
     cursor: Box<Cursor + 'a>,
+    snapshot: MvccSnapshot<'a>,
     start_ts: u64,
 }
 
@@ -68,7 +70,7 @@ impl<'a> StoreScanner<'a> {
             }
             key = try!(Key::from_encoded(self.cursor.key().to_vec()).truncate_ts());
             let cursor = self.cursor.as_mut();
-            let mut txn = MvccCursor::new(cursor, self.start_ts);
+            let mut txn = MvccCursor::new(cursor, &self.snapshot, self.start_ts);
             if let Some(v) = try!(txn.get(&key)) {
                 // TODO: find a way to avoid copy.
                 return Ok(Some((key, v.to_vec())));
@@ -85,7 +87,7 @@ impl<'a> StoreScanner<'a> {
             }
             key = try!(Key::from_encoded(self.cursor.key().to_vec()).truncate_ts());
             let cursor = self.cursor.as_mut();
-            let mut txn = MvccCursor::new(cursor, self.start_ts);
+            let mut txn = MvccCursor::new(cursor, &self.snapshot, self.start_ts);
             if let Some(v) = try!(txn.get(&key)) {
                 return Ok(Some((key, v.to_vec())));
             }
