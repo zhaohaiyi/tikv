@@ -14,9 +14,10 @@
 mod shard_mutex;
 mod store;
 mod scheduler;
+mod mem_rowlock;
 
 pub use self::scheduler::Scheduler;
-pub use self::store::{TxnStore, SnapshotStore};
+pub use self::store::SnapshotStore;
 
 quick_error! {
     #[derive(Debug)]

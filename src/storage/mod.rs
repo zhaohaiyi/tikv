@@ -17,6 +17,8 @@ use std::error;
 use std::sync::Arc;
 use self::txn::Scheduler;
 
+use mio::{self, EventLoop, EventLoopBuilder};
+
 pub mod engine;
 pub mod mvcc;
 pub mod txn;
@@ -177,9 +179,13 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn from_engine(engine: Box<Engine>) -> Result<Storage> {
+    pub fn from_engine(engine: Box<Engine>, event_loop: &mut EventLoop<Scheduler>) -> Result<Storage> {
         let engine = Arc::new(engine);
-        let sched = Scheduler::new(engine.clone());
+        let sched = Scheduler::new(engine.clone(), &event_loop);
+
+        info!("start storage scheduler");
+        try!(sched.start(event_loop));
+
         info!("storage {:?} started.", engine);
         Ok(Storage {
             engine: engine,
@@ -391,6 +397,16 @@ quick_error! {
             description(err.description())
         }
     }
+}
+
+pub fn create_event_loop(notify_capacity: usize, messages_per_tick: usize)
+    -> Result<EventLoop<Scheduler>>
+{
+    let mut builder = EventLoopBuilder::new();
+    builder.notify_capacity(notify_capacity);
+    builder.messages_per_tick(messages_per_tick);
+    let el = try!(builder.build());
+    Ok(el)
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;

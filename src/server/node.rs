@@ -25,13 +25,17 @@ use raftstore::store::{self, Msg, Store, Config as StoreConfig, keys, Peekable, 
 use super::Result;
 use super::config::Config;
 use storage::{Storage, RaftKv};
+use storage::{create_event_loop};
 use super::transport::ServerRaftStoreRouter;
 
 pub fn create_raft_storage<C>(node: Node<C>, db: Arc<DB>) -> Result<Storage>
     where C: PdClient + 'static
 {
+    // create scheduler eventloop
+    let event_loop = create_event_loop(4096, 4096);
+
     let engine = box RaftKv::new(node, db);
-    let store = try!(Storage::from_engine(engine));
+    let store = try!(Storage::from_engine(engine, &event_loop, 4096));
     Ok(store)
 }
 
