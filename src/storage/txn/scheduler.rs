@@ -11,31 +11,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::thread;
 use std::time::Duration;
-use std::boxed::{Box, FnBox};
+use std::boxed::Box;
 
 use std::sync::Arc;
-use threadpool::ThreadPool;
 use storage::{Engine, Command, Snapshot};
 use kvproto::kvrpcpb::Context;
-use storage::mvcc::{MvccTxn, MvccSnapshot, Error as MvccError, MvccCursor};
-use storage::{Key, Value, KvPair, Mutation};
+use storage::mvcc::{MvccTxn, Error as MvccError};
+use storage::{Key, Value};
 use std::collections::HashMap;
-use std::collections::LinkedList;
-use std::collections::BTreeSet;
-use mio::{self, EventLoop, EventLoopBuilder, NotifyError, Timeout};
+use mio::{self, EventLoop};
 
 use storage::engine::{Result as EngineResult, Callback};
 use super::Result;
 use super::Error;
-
-use std::result;
+use super::SchedCh;
 
 use super::store::SnapshotStore;
 use super::mem_rowlock::MemRowLocks;
 
-const MAX_SEND_RETRY_CNT: i32 = 20;
+const REPORT_STATISTIC_INTERVAL: u64 = 60000; // 60 seconds
+
+pub enum Tick {
+    ReportStatistic,
+}
 
 pub enum ProcessResult {
     ResultSet {
@@ -47,10 +46,6 @@ pub enum ProcessResult {
     },
 
     Nothing {},
-}
-
-pub enum Tick {
-    Nothing {}
 }
 
 pub enum Msg {
@@ -78,54 +73,6 @@ pub enum Msg {
         pr: ProcessResult,
         result: EngineResult<()>,
     },
-}
-
-// send_msg wraps Sender and retries some times if queue is full.
-pub fn send_msg<M: Send>(ch: &mio::Sender<M>, mut msg: M) -> result::Result<(), ()> {
-    for _ in 0..MAX_SEND_RETRY_CNT {
-        let r = ch.send(msg);
-        if r.is_ok() {
-            return Ok(());
-        }
-
-        match r.unwrap_err() {
-            NotifyError::Full(m) => {
-                warn!("notify queue is full, sleep and retry");
-                thread::sleep(Duration::from_millis(100));
-                msg = m;
-                continue;
-            }
-            e => {
-                return Err(());
-            }
-        }
-    }
-
-    // TODO: if we refactor with quick_error, we can use NotifyError instead later.
-    error!("notify channel is full");
-    Err(())
-}
-
-#[derive(Debug)]
-pub struct SendCh {
-    ch: mio::Sender<Msg>,
-}
-
-impl Clone for SendCh {
-    fn clone(&self) -> SendCh {
-        SendCh { ch: self.ch.clone() }
-    }
-}
-
-impl SendCh {
-    pub fn new(ch: mio::Sender<Msg>) -> SendCh {
-        SendCh { ch: ch }
-    }
-
-    pub fn send(&self, msg: Msg) -> result::Result<(), ()> {
-        try!(send_msg(&self.ch, msg));
-        Ok(())
-    }
 }
 
 type LockIdxs = Vec<usize>;
@@ -156,7 +103,7 @@ impl RunningCtx {
     }
 }
 
-fn make_write_cb(pr: ProcessResult, cid: u64, ch: SendCh) -> Callback<()> {
+fn make_write_cb(pr: ProcessResult, cid: u64, ch: SchedCh) -> Callback<()> {
     Box::new(move |result: EngineResult<()>| {
         if let Err(e) = ch.send(Msg::WriteFinish{
             cid: cid,
@@ -177,7 +124,7 @@ pub struct Scheduler {
     cmd_ctxs: HashMap<u64, RunningCtx>,
 
     //
-    sendch: SendCh,
+    schedch: SchedCh,
 
     // cmd id generator
     idalloc: u64,
@@ -187,7 +134,6 @@ pub struct Scheduler {
 
     // statistics for flow control
     running_cmd_count: u64,
-    pending_cmd_count: u64,
 }
 
 fn readonly_cmd(cmd: &Command) -> bool {
@@ -200,15 +146,14 @@ fn readonly_cmd(cmd: &Command) -> bool {
 }
 
 impl Scheduler {
-    pub fn new(engine: Arc<Box<Engine>>, sendch: SendCh, concurrency: usize) -> Scheduler {
+    pub fn new(engine: Arc<Box<Engine>>, schedch: SchedCh, concurrency: usize) -> Scheduler {
         Scheduler {
             engine: engine,
             cmd_ctxs: HashMap::new(),
-            sendch: sendch,
+            schedch: schedch,
             idalloc: 0,
             rowlocks: MemRowLocks::new(concurrency),
             running_cmd_count: 0,
-            pending_cmd_count: 0,
         }
     }
 
@@ -227,26 +172,34 @@ impl Scheduler {
     }
 
     fn finish_cmd(&mut self, cid: u64) {
-        {
-            let ctx = self.cmd_ctxs.get(&cid).unwrap();
+        debug!("cmd with cid = {} finished", cid);
 
-            assert_eq!(cid, ctx.cid);
+        {
+            // running ctx must existed
+            let rctx = self.cmd_ctxs.get(&cid).unwrap();
+            assert_eq!(cid, rctx.cid);
 
             // release lock and wake up waiting commands
-            let wakeup_list = self.rowlocks.release_by_indexs(&ctx.needed_locks, cid);
+            let wakeup_list = self.rowlocks.release_by_indexs(&rctx.needed_locks(), cid);
             for cid in wakeup_list {
-                self.sendch.send(Msg::AcquireLock { cid: cid });
+                if let Err(e) = self.schedch.send(Msg::AcquireLock { cid: cid }) {
+                    error!("wake up cmd failed, cid = {}, error = {:?}", cid, e);
+                }
             }
         }
 
         // remove context
         self.cmd_ctxs.remove(&cid);
+
+        self.running_cmd_count -= 1;
     }
 
     pub fn dispatch_cmd(&self, cmd: Command) {
         // Todo: flow control
 
-        self.sendch.send(Msg::CMD{ cmd: cmd });
+        if let Err(e) = self.schedch.send(Msg::CMD{ cmd: cmd }) {
+            error!("dispatch cmd failed, error = {:?}", e);
+        }
     }
 
     fn calc_lock_indexs(&self, cmd: &Command) -> Vec<usize> {
@@ -331,13 +284,12 @@ impl Scheduler {
                 let pr: ProcessResult = ProcessResult::ResultSet {
                     result: results,
                 };
-                let cb = make_write_cb(pr, cid, self.sendch.clone());
+                let cb = make_write_cb(pr, cid, self.schedch.clone());
 
                 try!(self.engine.async_write(ctx, txn.modifies(), cb));
             }
 
             Command::Commit { ref ctx, ref keys, lock_ts, commit_ts, .. } => {
-                let engine = self.engine.as_ref().as_ref();
                 let mut txn = MvccTxn::new(snapshot, lock_ts);
 
                 for k in keys {
@@ -345,7 +297,7 @@ impl Scheduler {
                 }
 
                 let pr: ProcessResult = ProcessResult::Nothing {};
-                let cb = make_write_cb(pr, cid, self.sendch.clone());
+                let cb = make_write_cb(pr, cid, self.schedch.clone());
 
                 try!(self.engine.async_write(ctx, txn.modifies(), cb));
             }
@@ -357,7 +309,7 @@ impl Scheduler {
 
                 let pr: ProcessResult = ProcessResult::Value { value: val };
 
-                let cb = make_write_cb(pr, cid, self.sendch.clone());
+                let cb = make_write_cb(pr, cid, self.schedch.clone());
 
                 try!(self.engine.async_write(ctx, txn.modifies(), cb));
             }
@@ -368,9 +320,9 @@ impl Scheduler {
                 try!(txn.rollback(&key));
 
                 let pr: ProcessResult = ProcessResult::Nothing {};
-                let cb = make_write_cb(pr, cid, self.sendch.clone());
+                let cb = make_write_cb(pr, cid, self.schedch.clone());
 
-                self.engine.async_write(&ctx, txn.modifies(), cb);
+                try!(self.engine.async_write(&ctx, txn.modifies(), cb));
             }
             Command::Rollback { ref ctx, ref keys, start_ts, .. } => {
                 let mut txn = MvccTxn::new(snapshot, start_ts);
@@ -380,7 +332,7 @@ impl Scheduler {
                 }
 
                 let pr: ProcessResult = ProcessResult::Nothing {};
-                let cb = make_write_cb(pr, cid, self.sendch.clone());
+                let cb = make_write_cb(pr, cid, self.schedch.clone());
 
                 try!(self.engine.async_write(ctx, txn.modifies(), cb));
             }
@@ -390,7 +342,7 @@ impl Scheduler {
                 let val = try!(txn.rollback_then_get(&key));
 
                 let pr: ProcessResult = ProcessResult::Value { value: val };
-                let cb = make_write_cb(pr, cid, self.sendch.clone());
+                let cb = make_write_cb(pr, cid, self.schedch.clone());
 
                 try!(self.engine.async_write(ctx, txn.modifies(), cb));
             }
@@ -457,68 +409,39 @@ impl Scheduler {
         }
     }
 
-    fn process_failed_cmd(&mut self, cid: u64, res: Result<()>) {
+    fn process_failed_cmd(&mut self, cid: u64, err: Error) {
         let rctx = self.cmd_ctxs.get_mut(&cid).unwrap();
 
         match rctx.cmd {
             Command::Get { ref mut callback, .. } => {
-                callback.take().unwrap()(match res {
-                    Ok(()) => { panic!("failed means occur some error"); }
-                    Err(e) => Err(e.into())
-                });
+                callback.take().unwrap()(Err(err.into()));
             }
             Command::BatchGet { ref mut callback, .. } => {
-                callback.take().unwrap()(match res {
-                    Ok(()) => { panic!("failed means occur some error"); }
-                    Err(e) => Err(e.into())
-                });
+                callback.take().unwrap()(Err(err.into()));
             }
             Command::Scan { ref mut callback, .. } => {
-                callback.take().unwrap()(match res {
-                    Ok(()) => { panic!("failed means occur some error"); }
-                    Err(e) => Err(e.into())
-                });
+                callback.take().unwrap()(Err(err.into()));
             }
             Command::Prewrite { ref mut callback, .. } => {
-                callback.take().unwrap()(match res {
-                    Ok(()) => { panic!("failed means occur some error"); }
-                    Err(e) => Err(e.into())
-                });
+                callback.take().unwrap()(Err(err.into()));
             }
             Command::Commit { ref mut callback, .. } => {
-                callback.take().unwrap()(match res {
-                    Ok(()) => { panic!("failed means occur some error"); }
-                    Err(e) => Err(e.into())
-                });
+                callback.take().unwrap()(Err(err.into()));
             }
             Command::CommitThenGet { ref mut callback, .. } => {
-                callback.take().unwrap()(match res {
-                    Ok(()) => { panic!("failed means occur some error"); }
-                    Err(e) => Err(e.into())
-                });
+                callback.take().unwrap()(Err(err.into()));
             }
             Command::Cleanup { ref mut callback, .. } => {
-                callback.take().unwrap()(match res {
-                    Ok(()) => { panic!("failed means occur some error"); }
-                    Err(e) => Err(e.into())
-                });
+                callback.take().unwrap()(Err(err.into()));
             }
             Command::Rollback { ref mut callback, .. } => {
-                callback.take().unwrap()(match res {
-                    Ok(()) => { panic!("failed means occur some error"); }
-                    Err(e) => Err(e.into())
-                });
+                callback.take().unwrap()(Err(err.into()));
             }
             Command::RollbackThenGet { ref mut callback, .. } => {
-                callback.take().unwrap()(match res {
-                    Ok(()) => { panic!("failed means occur some error"); }
-                    Err(e) => Err(e.into())
-                });
+                callback.take().unwrap()(Err(err.into()));
             }
         }
     }
-
-
 
     fn extract_cmd_context_by_id(&self, cid: u64) -> &Context {
         let rctx: &RunningCtx = self.cmd_ctxs.get(&cid).unwrap();
@@ -552,6 +475,28 @@ impl Scheduler {
             }
         }
     }
+
+    fn register_report_tick(&self, event_loop: &mut EventLoop<Self>) {
+        if let Err(e) = register_timer(event_loop, Tick::ReportStatistic, REPORT_STATISTIC_INTERVAL) {
+            error!("register report statistic err: {:?}", e);
+        };
+    }
+
+    fn on_report_staticstic_tick(&self, event_loop: &mut EventLoop<Self>) {
+        info!("all running cmd count = {}", self.running_cmd_count);
+
+        self.register_report_tick(event_loop);
+    }
+}
+
+fn register_timer(event_loop: &mut EventLoop<Scheduler>,
+    tick: Tick,
+    delay: u64)
+    -> Result<mio::Timeout> {
+    // TODO: now mio TimerError doesn't implement Error trait,
+    // so we can't use `try!` directly.
+    event_loop.timeout(tick, Duration::from_millis(delay))
+    .map_err(|e| box_err!("register timer err: {:?}", e))
 }
 
 impl mio::Handler for Scheduler {
@@ -560,7 +505,9 @@ impl mio::Handler for Scheduler {
     type Message = Msg;
 
     fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Tick) {
-        //
+        match timeout {
+            Tick::ReportStatistic => self.on_report_staticstic_tick(event_loop),
+        }
     }
 
     fn notify(&mut self, event_loop: &mut EventLoop<Self>, msg: Msg) {
@@ -571,13 +518,22 @@ impl mio::Handler for Scheduler {
             }
 
             Msg::CMD { cmd } => {
+                // statistic
+                self.running_cmd_count += 1;
+
                 // save cmd context and step forward
                 let cid = self.next_id();
+                debug!("receive cmd, cid = {}", cid);
+
                 if readonly_cmd(&cmd) {
                     let ctx: RunningCtx = RunningCtx::new(cid, cmd, vec![]);
                     self.save_cmd_context(cid, ctx);
 
-                    self.sendch.send(Msg::GetSnapshot{ cid: cid });
+                    if let Err(e) = self.schedch.send(Msg::GetSnapshot{ cid: cid }) {
+                        error!("send msg getsnapshot failed, cid = {}, error = {:?}", cid, e);
+                        self.process_failed_cmd(cid, e);
+                        self.finish_cmd(cid);
+                    }
                 } else {
                     let lock_idxs = self.calc_lock_indexs(&cmd);
                     let mut ctx: RunningCtx = RunningCtx::new(cid, cmd, lock_idxs);
@@ -588,7 +544,11 @@ impl mio::Handler for Scheduler {
                     ctx.owned_lock_count += acquire_count;
 
                     if ctx.all_lock_acquired() {
-                        self.sendch.send(Msg::GetSnapshot{ cid: cid });
+                        if let Err(e) = self.schedch.send(Msg::GetSnapshot { cid: cid }) {
+                            error!("send msg getsnapshot failed, cid = {}, error = {:?}", cid, e);
+                            self.process_failed_cmd(cid, e);
+                            self.finish_cmd(cid);
+                        }
                     }
 
                     self.save_cmd_context(cid, ctx);
@@ -596,22 +556,36 @@ impl mio::Handler for Scheduler {
             }
 
             Msg::AcquireLock { cid } => {
-                debug!("receive checklock msg cid = {}", cid);
-                let ref mut ctx = self.cmd_ctxs.get_mut(&cid).unwrap();
+                debug!("receive checklock msg for cid = {}", cid);
 
-                let new_acquired = {
-                    let needed_locks = ctx.needed_locks();
-                    let owned_count = ctx.owned_lock_count;
-                    self.rowlocks.acquire_by_indexs(&needed_locks[owned_count..], cid)
-                };
-                ctx.owned_lock_count += new_acquired;
-                if ctx.all_lock_acquired() {
-                    self.sendch.send(Msg::GetSnapshot{ cid: cid });
+                let mut all_lock_acquired = false;
+                {
+                    let ref mut ctx = self.cmd_ctxs.get_mut(&cid).unwrap();
+
+                    let new_acquired = {
+                        let needed_locks = ctx.needed_locks();
+                        let owned_count = ctx.owned_lock_count;
+                        self.rowlocks.acquire_by_indexs(&needed_locks[owned_count..], cid)
+                    };
+                    ctx.owned_lock_count += new_acquired;
+                    if ctx.all_lock_acquired() {
+                        all_lock_acquired = true;
+                    }
+                }
+
+                if all_lock_acquired {
+                    if let Err(e) = self.schedch.send(Msg::GetSnapshot{ cid: cid }) {
+                        error!("send msg getsnapshot failed, cid = {}, error = {:?}", cid, e);
+                        self.process_failed_cmd(cid, e);
+                        self.finish_cmd(cid);
+                    }
                 }
             }
 
             Msg::GetSnapshot { cid } => {
-                let ch = self.sendch.clone();
+                debug!("receive get snapshot msg for cid = {}", cid);
+
+                let ch = self.schedch.clone();
                 let cb = box move |snapshot: EngineResult<Box<Snapshot>>| {
                     if let Err(e) = ch.send(Msg::SnapshotFinish{
                         cid: cid,
@@ -626,13 +600,15 @@ impl mio::Handler for Scheduler {
                 match self.engine.async_snapshot(self.extract_cmd_context_by_id(cid), cb) {
                     Ok(()) => { }
                     Err(e) => {
-                        self.process_failed_cmd(cid, Err(e.into()));
+                        self.process_failed_cmd(cid, Error::from(e));
                         self.finish_cmd(cid);
                     }
                 }
             }
 
             Msg::SnapshotFinish { cid, snapshot } => {
+                debug!("receive snapshot finish msg for cid = {}", cid);
+
                 match snapshot {
                     Ok(snapshot) => {
                         let res = self.process_cmd_with_snapshot(cid, snapshot.as_ref());
@@ -646,7 +622,7 @@ impl mio::Handler for Scheduler {
                                 }
                             }
                             Err(e) => {
-                                self.process_failed_cmd(cid, Err(Error::from(e)));
+                                self.process_failed_cmd(cid, Error::from(e));
                                 finished = true;
                             }
                         }
@@ -656,13 +632,14 @@ impl mio::Handler for Scheduler {
                         }
                     }
                     Err(e) => {
-                        self.process_failed_cmd(cid, Err(Error::from(e)));
+                        self.process_failed_cmd(cid, Error::from(e));
                         self.finish_cmd(cid);
                     }
                 }
             }
 
             Msg::WriteFinish { cid, pr, result } => {
+                debug!("receive write finish msg for cid = {}", cid);
                 self.process_write_finish(cid, pr, result);
                 self.finish_cmd(cid);
             }

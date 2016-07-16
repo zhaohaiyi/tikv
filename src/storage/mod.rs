@@ -11,16 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::thread;
 use std::boxed::FnBox;
 use std::fmt;
 use std::error;
 use std::sync::Arc;
 use std::io::Error as IoError;
-use std::thread;
 
-pub use self::txn::{SendCh as SchedCh};
-
-use mio::{self, EventLoop, EventLoopBuilder};
+use mio::{EventLoop, EventLoopBuilder};
 
 pub mod engine;
 pub mod mvcc;
@@ -30,7 +28,7 @@ mod types;
 pub use self::engine::{Engine, Snapshot, Dsn, TEMP_DIR, new_engine, Modify, Cursor,
                        Error as EngineError};
 pub use self::engine::raftkv::RaftKv;
-pub use self::txn::{SnapshotStore, Scheduler, Msg};
+pub use self::txn::{SnapshotStore, Scheduler, Msg, SchedCh};
 pub use self::types::{Key, Value, KvPair};
 pub type Callback<T> = Option<Box<FnBox(Result<T>) + Send>>;
 
@@ -231,9 +229,15 @@ impl Storage {
             return Ok(());
         }
 
-        self.schedch.send(Msg::Quit);
+        if let Err(e) = self.schedch.send(Msg::Quit) {
+            error!("send quit cmd to scheduler failed, error = {:?}", e);
+            return Err(Error::from(e));
+        }
+
         let h = self.sched_handle.take().unwrap();
-        h.join();
+        if let Err(e) = h.join() {
+            return Err(box_err!("failed to join sched_handle, err = {:?}", e));
+        }
 
         info!("storage {:?} closed.", self.engine);
 
@@ -246,7 +250,7 @@ impl Storage {
 
     fn send(&self, cmd: Command) -> Result<()> {
         match self.sched_handle {
-            Some(ref h) => self.schedch.send(Msg::CMD{ cmd:cmd }),
+            Some(ref h) => try!(self.schedch.send(Msg::CMD{ cmd:cmd })),
             None => return Err(Error::Closed),
         };
         Ok(())
@@ -455,47 +459,51 @@ mod tests {
     use kvproto::kvrpcpb::Context;
 
     fn expect_get_none(done: Sender<i32>) -> Callback<Option<Value>> {
-        Box::new(move |x: Result<Option<Value>>| {
+        Some(Box::new(move |x: Result<Option<Value>>| {
             assert_eq!(x.unwrap(), None);
             done.send(1).unwrap();
-        })
+        }))
     }
 
     fn expect_get_val(done: Sender<i32>, v: Vec<u8>) -> Callback<Option<Value>> {
-        Box::new(move |x: Result<Option<Value>>| {
+        Some(Box::new(move |x: Result<Option<Value>>| {
             assert_eq!(x.unwrap().unwrap(), v);
             done.send(1).unwrap();
-        })
+        }))
     }
 
     fn expect_ok<T>(done: Sender<i32>) -> Callback<T> {
-        Box::new(move |x: Result<T>| {
+        Some(Box::new(move |x: Result<T>| {
             assert!(x.is_ok());
             done.send(1).unwrap();
-        })
+        }))
     }
 
     fn expect_fail<T>(done: Sender<i32>) -> Callback<T> {
-        Box::new(move |x: Result<T>| {
+        Some(Box::new(move |x: Result<T>| {
             assert!(x.is_err());
             done.send(1).unwrap();
-        })
+        }))
     }
 
     fn expect_scan(done: Sender<i32>, pairs: Vec<Option<KvPair>>) -> Callback<Vec<Result<KvPair>>> {
-        Box::new(move |rlt: Result<Vec<Result<KvPair>>>| {
+        Some(Box::new(move |rlt: Result<Vec<Result<KvPair>>>| {
             let rlt: Vec<Option<KvPair>> = rlt.unwrap()
                 .into_iter()
                 .map(Result::ok)
                 .collect();
             assert_eq!(rlt, pairs);
             done.send(1).unwrap()
-        })
+        }))
     }
 
     #[test]
     fn test_get_put() {
-        let mut storage = Storage::new(Dsn::RocksDBPath(TEMP_DIR)).unwrap();
+        let mut event_loop = create_event_loop(4096, 256).unwrap();
+        let mut storage = Storage::new(Dsn::RocksDBPath(TEMP_DIR), &mut event_loop).unwrap();
+        if let Err(e) = storage.start(event_loop, 4096) {
+            panic!("storage start failed, err={:?}", e);
+        }
         let (tx, rx) = channel();
         storage.async_get(Context::new(),
                        make_key(b"x"),
@@ -529,11 +537,17 @@ mod tests {
                        expect_get_val(tx.clone(), b"100".to_vec()))
             .unwrap();
         rx.recv().unwrap();
-        storage.stop().unwrap();
+        if let Err(e) = storage.stop() {
+            panic!("storage start failed, err={:?}", e);
+        }
     }
     #[test]
     fn test_scan() {
-        let mut storage = Storage::new(Dsn::RocksDBPath(TEMP_DIR)).unwrap();
+        let mut event_loop = create_event_loop(4096, 256).unwrap();
+        let mut storage = Storage::new(Dsn::RocksDBPath(TEMP_DIR), &mut event_loop).unwrap();
+        if let Err(e) = storage.start(event_loop, 4096) {
+            panic!("storage start failed, err={:?}", e);
+        }
         let (tx, rx) = channel();
         storage.async_prewrite(Context::new(),
                             vec![
@@ -565,12 +579,18 @@ mod tests {
             ]))
             .unwrap();
         rx.recv().unwrap();
-        storage.stop().unwrap();
+        if let Err(e) = storage.stop() {
+            panic!("storage start failed, err={:?}", e);
+        }
     }
 
     #[test]
     fn test_txn() {
-        let mut storage = Storage::new(Dsn::RocksDBPath(TEMP_DIR)).unwrap();
+        let mut event_loop = create_event_loop(4096, 256).unwrap();
+        let mut storage = Storage::new(Dsn::RocksDBPath(TEMP_DIR), &mut event_loop).unwrap();
+        if let Err(e) = storage.start(event_loop, 4096) {
+            panic!("storage start failed, err={:?}", e);
+        }
         let (tx, rx) = channel();
         storage.async_prewrite(Context::new(),
                             vec![Mutation::Put((make_key(b"x"), b"100".to_vec()))],
@@ -619,6 +639,8 @@ mod tests {
                             expect_fail(tx.clone()))
             .unwrap();
         rx.recv().unwrap();
-        storage.stop().unwrap();
+        if let Err(e) = storage.stop() {
+            panic!("storage start failed, err={:?}", e);
+        }
     }
 }

@@ -433,12 +433,14 @@ fn get_store_path(matches: &Matches, config: &toml::Value) -> String {
     format!("{}", absolute_path.display())
 }
 
-fn run_local_server(listener: TcpListener, mut store: Storage, mut sched_event_loop: EventLoop<Scheduler>, config: &Config) {
+fn run_local_server(listener: TcpListener, mut store: Storage, sched_event_loop: EventLoop<Scheduler>, config: &Config) {
     let mut event_loop = create_event_loop(config).unwrap();
     let router = Arc::new(RwLock::new(MockRaftStoreRouter));
     let snap_mgr = store::new_snap_mgr(TEMP_DIR, None);
 
-    store.start(sched_event_loop, config.storage_sched_concurrency);
+    if let Err(e) = store.start(sched_event_loop, config.storage_sched_concurrency) {
+        panic!("failed to start storage, error = {:?}", e);
+    }
 
     let mut svr = Server::new(&mut event_loop,
                               config,
@@ -487,7 +489,10 @@ fn run_raft_server(listener: TcpListener, matches: &Matches, config: &toml::Valu
     initial_metric(matches, config, Some(node_id));
 
     info!("start storage");
-    store.start(sched_event_loop, cfg.storage_sched_concurrency);
+
+    if let Err(e) = store.start(sched_event_loop, cfg.storage_sched_concurrency) {
+        panic!("failed to start storage, error = {:?}", e);
+    }
 
     let mut svr = Server::new(&mut event_loop,
                               cfg,

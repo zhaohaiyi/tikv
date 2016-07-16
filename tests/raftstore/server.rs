@@ -28,7 +28,7 @@ use tikv::server::{Node, Config, create_raft_storage, PdStoreAddrResolver};
 use tikv::raftstore::{Error, Result};
 use tikv::raftstore::store::{self, SendCh as StoreSendCh};
 use tikv::util::codec::{Error as CodecError, rpc};
-use tikv::storage::{self, SchedCh, Storage, Engine, CfName, DEFAULT_CFS};
+use tikv::storage::{self, Engine, CfName, DEFAULT_CFS};
 use tikv::util::{make_std_tcp_conn, HandyRwLock};
 use kvproto::raft_serverpb;
 use kvproto::msgpb::{Message, MessageType};
@@ -170,7 +170,9 @@ impl Simulator for ServerCluster {
 
         let mut sched_event_loop = storage::create_event_loop(cfg.notify_capacity, cfg.messages_per_tick).unwrap();
         let mut store = create_raft_storage(node, engine, &mut sched_event_loop).unwrap();
-        store.start(sched_event_loop, cfg.storage_sched_concurrency);
+        if let Err(e) = store.start(sched_event_loop, cfg.storage_sched_concurrency){
+            panic!("storage start failed, error = {:?}", e);
+        }
         self.storages.insert(node_id, store.get_engine());
 
         let mut server = Server::new(&mut event_loop,
