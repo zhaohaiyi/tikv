@@ -17,7 +17,7 @@ use tempdir::TempDir;
 
 use test_util::*;
 use tikv::storage::{self, Dsn, Mutation, Key, DEFAULT_CFS};
-use tikv::storage::txn::TxnStore;
+//use tikv::storage::txn::TxnStore;
 use tikv::storage::mvcc::TEST_TS_BASE;
 use kvproto::kvrpcpb::Context;
 
@@ -25,55 +25,55 @@ use super::print_result;
 
 /// In mvcc kv is not actually deleted, which may cause performance issue
 /// when doing scan.
-fn bench_tombstone_scan(dsn: Dsn) -> BenchSamples {
-    let engine = storage::new_engine(dsn, DEFAULT_CFS).unwrap();
-
-    let store = TxnStore::new(Arc::new(engine));
-    let mut ts_generator = TEST_TS_BASE..;
-
-    let mut kvs = KvGenerator::new(100, 1000);
-
-    for (k, v) in kvs.take(100000) {
-        let mut ts = ts_generator.next().unwrap();
-        store.prewrite(Context::new(),
-                      vec![Mutation::Put((Key::from_raw(&k), v))],
-                      k.clone(),
-                      ts)
-            .expect("");
-        store.commit(Context::new(),
-                    vec![Key::from_raw(&k)],
-                    ts,
-                    ts_generator.next().unwrap())
-            .expect("");
-
-        ts = ts_generator.next().unwrap();
-        store.prewrite(Context::new(),
-                      vec![Mutation::Delete(Key::from_raw(&k))],
-                      k.clone(),
-                      ts)
-            .expect("");
-        store.commit(Context::new(),
-                    vec![Key::from_raw(&k)],
-                    ts,
-                    ts_generator.next().unwrap())
-            .expect("");
-    }
-
-    kvs = KvGenerator::new(100, 1000);
-    bench!{
-        let (k, _) = kvs.next().unwrap();
-        assert!(store.scan(Context::new(),
-                           Key::from_raw(&k),
-                           1,
-                           ts_generator.next().unwrap())
-                     .unwrap()
-                     .is_empty())
-    }
-}
+//fn bench_tombstone_scan(dsn: Dsn) -> BenchSamples {
+//    let engine = storage::new_engine(dsn, DEFAULT_CFS).unwrap();
+//
+//    let store = TxnStore::new(Arc::new(engine));
+//    let mut ts_generator = TEST_TS_BASE..;
+//
+//    let mut kvs = KvGenerator::new(100, 1000);
+//
+//    for (k, v) in kvs.take(100000) {
+//        let mut ts = ts_generator.next().unwrap();
+//        store.prewrite(Context::new(),
+//                      vec![Mutation::Put((Key::from_raw(&k), v))],
+//                      k.clone(),
+//                      ts)
+//            .expect("");
+//        store.commit(Context::new(),
+//                    vec![Key::from_raw(&k)],
+//                    ts,
+//                    ts_generator.next().unwrap())
+//            .expect("");
+//
+//        ts = ts_generator.next().unwrap();
+//        store.prewrite(Context::new(),
+//                      vec![Mutation::Delete(Key::from_raw(&k))],
+//                      k.clone(),
+//                      ts)
+//            .expect("");
+//        store.commit(Context::new(),
+//                    vec![Key::from_raw(&k)],
+//                    ts,
+//                    ts_generator.next().unwrap())
+//            .expect("");
+//    }
+//
+//    kvs = KvGenerator::new(100, 1000);
+//    bench!{
+//        let (k, _) = kvs.next().unwrap();
+//        assert!(store.scan(Context::new(),
+//                           Key::from_raw(&k),
+//                           1,
+//                           ts_generator.next().unwrap())
+//                     .unwrap()
+//                     .is_empty())
+//    }
+//}
 
 pub fn bench_engine() {
-    let path = TempDir::new("bench-mvcc").unwrap();
-    let dsn = Dsn::RocksDBPath(path.path().to_str().unwrap());
-    printf!("benching tombstone scan with rocksdb\t...\t");
-    print_result(bench_tombstone_scan(dsn));
+//    let path = TempDir::new("bench-mvcc").unwrap();
+//    let dsn = Dsn::RocksDBPath(path.path().to_str().unwrap());
+//    printf!("benching tombstone scan with rocksdb\t...\t");
+//    print_result(bench_tombstone_scan(dsn));
 }

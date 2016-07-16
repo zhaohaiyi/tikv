@@ -15,16 +15,33 @@
 use std::collections::{LinkedList, BTreeSet};
 use std::hash::{Hash, SipHasher, Hasher};
 
-pub struct RowLocks {
-    // linked list store waiting commands, tree set use to check existed
-    locks: Vec<(LinkedList<u64>, BTreeSet<u64>)>,
+// simulate lock of one row
+pub struct RowLock {
+    // store waiting commands
+    pub waiting: LinkedList<u64>,
+
+    // use to check existed
+    pub set: BTreeSet<u64>,
+}
+
+impl RowLock {
+    pub fn new() -> RowLock {
+        RowLock {
+            waiting: LinkedList::new(),
+            set: BTreeSet::new(),
+        }
+    }
+}
+
+pub struct MemRowLocks {
+    locks: Vec<RowLock>,
     size: usize,
 }
 
-impl RowLocks {
-    pub fn new(size: usize) -> RowLocks {
-        RowLocks {
-            locks: (0..size).map(|_|  (LinkedList::new(), BTreeSet::new())).collect(),
+impl MemRowLocks {
+    pub fn new(size: usize) -> MemRowLocks {
+        MemRowLocks {
+            locks: (0..size).map(|_|  RowLock::new()).collect(),
             size: size,
         }
     }
@@ -38,27 +55,33 @@ impl RowLocks {
         indices
     }
 
-    pub fn acquire_by_indexs(&self, indexs: &[usize], who: u64) -> usize {
+    pub fn acquire_by_indexs(&mut self, indexs: &[usize], who: u64) -> usize {
 
         let mut acquired_count: usize = 0;
-        for i in 0..indexs.len() {
-            let (mut waiting_list, mut sets) = self.locks[i];
+        for i in indexs {
+            let ref mut rowlock = self.locks.get_mut(*i).unwrap();
 
-            match waiting_list.front() {
+            let mut front: Option<u64> = None;
+            if let Some(cid) = rowlock.waiting.front() {
+                let fcid = *cid;
+                front = Some(fcid);
+            }
+
+            match front {
                 Some(cid) => {
                     if cid == who {
                         acquired_count += 1;
                     } else {
-                        if !sets.contains(cid) {
-                            waiting_list.push_back(who);
-                            sets.insert(who);
+                        if !rowlock.set.contains(&cid) {
+                            rowlock.waiting.push_back(who);
+                            rowlock.set.insert(who);
                         }
                         return acquired_count;
                     }
                 }
                 None => {
-                    waiting_list.push_back(who);
-                    sets.insert(who);
+                    rowlock.waiting.push_back(who);
+                    rowlock.set.insert(who);
                     acquired_count += 1;
                 }
             }
@@ -68,13 +91,13 @@ impl RowLocks {
     }
 
     // release all locks owned, and return wakeup list
-    pub fn release_by_indexs(&self, indexs: &[usize], who: u64) -> Vec<u64> {
-        let mut wakeup_list = vec![];
+    pub fn release_by_indexs(&mut self, indexs: &[usize], who: u64) -> Vec<u64> {
+        let mut wakeup_list: Vec<u64> = vec![];
 
         for i in indexs {
-            let (mut waiting_list, mut sets) = self.locks[i];
+            let ref mut rowlock = self.locks.get_mut(*i).unwrap();
 
-            match waiting_list.pop_front() {
+            match rowlock.waiting.pop_front() {
                 Some(head) => {
                     if head != who {
                         panic!("release lock not owned");
@@ -84,11 +107,11 @@ impl RowLocks {
                     panic!("should not happen");
                 }
             }
-            sets.remove(who);
+            rowlock.set.remove(&who);
 
-            match waiting_list.front() {
+            match rowlock.waiting.front() {
                 Some(wakeup) => {
-                    wakeup_list.push_back();
+                    wakeup_list.push(*wakeup);
                 }
                 None => {}
             }

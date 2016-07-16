@@ -16,7 +16,9 @@ mod store;
 mod scheduler;
 mod mem_rowlock;
 
-pub use self::scheduler::Scheduler;
+use std::error;
+
+pub use self::scheduler::{Scheduler, SendCh, Msg};
 pub use self::store::SnapshotStore;
 
 quick_error! {
@@ -36,6 +38,12 @@ quick_error! {
             from()
             cause(err)
             description(err.description())
+        }
+        Other(err: Box<error::Error + Sync + Send>) {
+            from()
+            cause(err.as_ref())
+            description(err.description())
+            display("{:?}", err)
         }
     }
 }

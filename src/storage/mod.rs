@@ -15,7 +15,10 @@ use std::boxed::FnBox;
 use std::fmt;
 use std::error;
 use std::sync::Arc;
-use self::txn::Scheduler;
+use std::io::Error as IoError;
+use std::thread;
+
+pub use self::txn::{SendCh as SchedCh};
 
 use mio::{self, EventLoop, EventLoopBuilder};
 
@@ -27,9 +30,9 @@ mod types;
 pub use self::engine::{Engine, Snapshot, Dsn, TEMP_DIR, new_engine, Modify, Cursor,
                        Error as EngineError};
 pub use self::engine::raftkv::RaftKv;
-pub use self::txn::SnapshotStore;
+pub use self::txn::{SnapshotStore, Scheduler, Msg};
 pub use self::types::{Key, Value, KvPair};
-pub type Callback<T> = Box<FnBox(Result<T>) + Send>;
+pub type Callback<T> = Option<Box<FnBox(Result<T>) + Send>>;
 
 pub type CfName = &'static str;
 pub const DEFAULT_CFS: &'static [CfName] = &["default", "lock"];
@@ -37,7 +40,7 @@ pub const DEFAULT_CFS: &'static [CfName] = &["default", "lock"];
 #[cfg(test)]
 pub use self::types::make_key;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Mutation {
     Put((Key, Value)),
     Delete(Key),
@@ -175,35 +178,65 @@ impl fmt::Display for Command {
 
 pub struct Storage {
     engine: Arc<Box<Engine>>,
-    sched: Option<Scheduler>,
+    schedch: SchedCh,
+    sched_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Storage {
-    pub fn from_engine(engine: Box<Engine>, event_loop: &mut EventLoop<Scheduler>) -> Result<Storage> {
-        let engine = Arc::new(engine);
-        let sched = Scheduler::new(engine.clone(), &event_loop);
+    pub fn from_engine(
+        engine: Box<Engine>,
+        sched_event_loop: &mut EventLoop<Scheduler>)
+        -> Result<Storage> {
 
-        info!("start storage scheduler");
-        try!(sched.start(event_loop));
+        let engine = Arc::new(engine);
+        let schedch = SchedCh::new(sched_event_loop.channel());
 
         info!("storage {:?} started.", engine);
         Ok(Storage {
             engine: engine,
-            sched: Some(sched),
+            schedch: schedch,
+            sched_handle: None,
         })
     }
 
-    pub fn new(dsn: Dsn) -> Result<Storage> {
+    pub fn new(dsn: Dsn, sched_event_loop: &mut EventLoop<Scheduler>) -> Result<Storage> {
         let engine = try!(engine::new_engine(dsn, DEFAULT_CFS));
-        Storage::from_engine(engine)
+        Storage::from_engine(engine, sched_event_loop)
+    }
+
+    pub fn start(&mut self, mut sched_event_loop: EventLoop<Scheduler>, concurrency: usize) -> Result<()> {
+        if self.sched_handle.is_some() {
+            return Err(box_err!("scheduler is already running"));
+        }
+
+        let builder = thread::Builder::new().name(thd_name!(format!("storage-scheduler")));
+
+        let engine = self.engine.clone();
+
+        let h = try!(builder.spawn(move || {
+            let ch = SchedCh::new(sched_event_loop.channel());
+            let mut sched = Scheduler::new(engine, ch, concurrency);
+            if let Err(e) = sched_event_loop.run(&mut sched) {
+                error!("scheduler run err {:?}", e);
+            }
+            info!("scheduler stopping");
+        }));
+        self.sched_handle = Some(h);
+
+        Ok(())
     }
 
     pub fn stop(&mut self) -> Result<()> {
-        if self.sched.is_none() {
+        if self.sched_handle.is_none() {
             return Ok(());
         }
-        self.sched.take();
+
+        self.schedch.send(Msg::Quit);
+        let h = self.sched_handle.take().unwrap();
+        h.join();
+
         info!("storage {:?} closed.", self.engine);
+
         Ok(())
     }
 
@@ -212,8 +245,8 @@ impl Storage {
     }
 
     fn send(&self, cmd: Command) -> Result<()> {
-        match self.sched {
-            Some(ref sched) => sched.exec(cmd),
+        match self.sched_handle {
+            Some(ref h) => self.schedch.send(Msg::CMD{ cmd:cmd }),
             None => return Err(Error::Closed),
         };
         Ok(())
@@ -395,8 +428,15 @@ quick_error! {
             cause(err.as_ref())
             description(err.description())
         }
+        Io(err: IoError) {
+            from()
+            cause(err)
+            description(err.description())
+        }
     }
 }
+
+pub type Result<T> = ::std::result::Result<T, Error>;
 
 pub fn create_event_loop(notify_capacity: usize, messages_per_tick: usize)
     -> Result<EventLoop<Scheduler>>
@@ -407,8 +447,6 @@ pub fn create_event_loop(notify_capacity: usize, messages_per_tick: usize)
     let el = try!(builder.build());
     Ok(el)
 }
-
-pub type Result<T> = ::std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
