@@ -24,7 +24,7 @@ use raftstore::store::{self, Msg, Store, Config as StoreConfig, keys, Peekable, 
                        SnapManager};
 use super::Result;
 use super::config::Config;
-use storage::{Storage, RaftKv, Scheduler, SchedCh};
+use storage::{Storage, RaftKv, Scheduler};
 use super::transport::ServerRaftStoreRouter;
 
 pub fn create_raft_storage<C>(
