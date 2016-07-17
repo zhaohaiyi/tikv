@@ -55,11 +55,7 @@ impl Unstable {
     pub fn maybe_first_index(&self) -> Option<u64> {
         self.snapshot
             .as_ref()
-            .map_or(None, |snap| Some(snap.get_metadata().get_index() + 1))
-    }
-
-    pub fn get_snapshot(&self) -> Snapshot {
-        self.snapshot.as_ref().unwrap().clone()
+            .map(|snap| snap.get_metadata().get_index() + 1)
     }
 
     // maybe_last_index returns the last index if it has at least one
@@ -69,7 +65,7 @@ impl Unstable {
             0 => {
                 self.snapshot
                     .as_ref()
-                    .map_or(None, |snap| Some(snap.get_metadata().get_index()))
+                    .map(|snap| snap.get_metadata().get_index())
             }
             len => Some(self.offset + len as u64 - 1),
         }
@@ -89,15 +85,12 @@ impl Unstable {
             }
             return None;
         }
-        match self.maybe_last_index() {
-            None => None,
-            Some(last) => {
-                if idx > last {
-                    return None;
-                }
-                Some(self.entries[(idx - self.offset) as usize].get_term())
+        self.maybe_last_index().and_then(|last| {
+            if idx > last {
+                return None;
             }
-        }
+            Some(self.entries[(idx - self.offset) as usize].get_term())
+        })
     }
 
     pub fn stable_to(&mut self, idx: u64, term: u64) {
@@ -143,13 +136,9 @@ impl Unstable {
         } else {
             // truncate to after and copy to self.entries then append
             let off = self.offset;
-            self.entries = {
-                let cut_ents = self.slice(off, after);
-                let mut entries = Vec::with_capacity(cut_ents.len() + ents.len());
-                entries.extend_from_slice(cut_ents);
-                entries.extend_from_slice(ents);
-                entries
-            };
+            self.must_check_outofbounds(off, after);
+            self.entries.truncate((after - off) as usize);
+            self.entries.extend_from_slice(ents);
         }
     }
 

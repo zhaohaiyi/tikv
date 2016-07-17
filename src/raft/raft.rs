@@ -279,6 +279,11 @@ impl<T: Storage> Raft<T> {
     }
 
     #[inline]
+    pub fn mut_store(&mut self) -> &mut T {
+        self.raft_log.mut_store()
+    }
+
+    #[inline]
     pub fn get_snap(&self) -> Option<&Snapshot> {
         self.raft_log.get_unstable().snapshot.as_ref()
     }
@@ -1086,14 +1091,13 @@ impl<T: Storage> Raft<T> {
     }
 
     fn step_follower(&mut self, mut m: Message) {
-        let term = self.term;
         match m.get_msg_type() {
             MessageType::MsgPropose => {
                 if self.leader_id == INVALID_ID {
                     info!("{} {} no leader at term {}; dropping proposal",
                           self.tag,
                           self.id,
-                          term);
+                          self.term);
                     return;
                 }
                 m.set_to(self.leader_id);
@@ -1111,6 +1115,7 @@ impl<T: Storage> Raft<T> {
             }
             MessageType::MsgSnapshot => {
                 self.election_elapsed = 0;
+                self.leader_id = m.get_from();
                 self.handle_snapshot(m);
             }
             MessageType::MsgRequestVote => {
