@@ -11,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::thread;
 use std::time::Duration;
 use std::boxed::Box;
 
@@ -31,6 +32,7 @@ use super::store::SnapshotStore;
 use super::mem_rowlock::MemRowLocks;
 
 const REPORT_STATISTIC_INTERVAL: u64 = 60000; // 60 seconds
+const SLOW_DWON_THREASHOLD: u64 = 1000; //
 
 pub enum Tick {
     ReportStatistic,
@@ -170,6 +172,13 @@ impl Scheduler {
         self.running_cmd_count -= 1;
     }
 
+    fn should_slow_down(&self) -> bool {
+        if self.running_cmd_count > SLOW_DWON_THREASHOLD {
+            return true;
+        }
+        false
+    }
+
     fn save_cmd_context(&mut self, cid: u64, ctx: RunningCtx) {
         debug!("save running context for cid = {}", cid);
 
@@ -205,8 +214,12 @@ impl Scheduler {
     }
 
     pub fn dispatch_cmd(&self, cmd: Command) {
-        // Todo: flow control
+        // flow control
+        if self.should_slow_down() {
+            thread::sleep(Duration::from_millis(10));
+        }
 
+        // dispatch cmd
         if let Err(e) = self.schedch.send(Msg::CMD{ cmd: cmd }) {
             error!("dispatch cmd failed, error = {:?}", e);
         }
