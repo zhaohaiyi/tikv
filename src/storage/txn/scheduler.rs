@@ -518,7 +518,6 @@ impl mio::Handler for Scheduler {
             }
 
             Msg::CMD { cmd } => {
-                // statistic
                 self.running_cmd_count += 1;
 
                 // save cmd context and step forward
@@ -526,6 +525,7 @@ impl mio::Handler for Scheduler {
                 debug!("receive cmd, cid = {}", cid);
 
                 if readonly_cmd(&cmd) {
+                    // readonly command don't need lock, step to GetSnapshot
                     let ctx: RunningCtx = RunningCtx::new(cid, cmd, vec![]);
                     self.save_cmd_context(cid, ctx);
 
@@ -534,12 +534,14 @@ impl mio::Handler for Scheduler {
                         self.process_failed_cmd(cid, e);
                         self.finish_cmd(cid);
                     }
+
                 } else {
+                    // write command need acquire row lock first
+                    // if acquire all locks then get snapshot, or this command
+                    // will be wake up by who owned lock after release lock
                     let lock_idxs = self.calc_lock_indexs(&cmd);
                     let mut ctx: RunningCtx = RunningCtx::new(cid, cmd, lock_idxs);
 
-                    // if acquire all locks then get snapshot, or this command
-                    // will be wake up by who owned lock after release lock
                     let acquire_count = self.rowlocks.acquire_by_indexs(ctx.needed_locks(), cid);
                     ctx.owned_lock_count += acquire_count;
 
