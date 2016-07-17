@@ -162,7 +162,17 @@ impl Scheduler {
         self.idalloc
     }
 
+    fn incr_running_cmd(&mut self) {
+        self.running_cmd_count += 1;
+    }
+
+    fn decr_running_cmd(&mut self) {
+        self.running_cmd_count -= 1;
+    }
+
     fn save_cmd_context(&mut self, cid: u64, ctx: RunningCtx) {
+        debug!("save running context for cid = {}", cid);
+
         match self.cmd_ctxs.insert(cid, ctx) {
             Some(_) => {
                 panic!("cid = {} existed, fatal", cid);
@@ -191,7 +201,7 @@ impl Scheduler {
         // remove context
         self.cmd_ctxs.remove(&cid);
 
-        self.running_cmd_count -= 1;
+        self.decr_running_cmd();
     }
 
     pub fn dispatch_cmd(&self, cmd: Command) {
@@ -351,64 +361,6 @@ impl Scheduler {
         Ok(())
     }
 
-    fn process_write_finish(&mut self, cid: u64, pr: ProcessResult, result: EngineResult<()>) {
-
-        let rctx = self.cmd_ctxs.get_mut(&cid).unwrap();
-
-        assert_eq!(cid, rctx.cid);
-        match rctx.cmd {
-            Command::Prewrite { ref mut callback, .. } => {
-                callback.take().unwrap()(match result {
-                    Ok(()) => {
-                        match pr {
-                            ProcessResult::ResultSet { mut result } => {
-                                Ok(result.drain(..).map(|x| x.map_err(::storage::Error::from)).collect())
-                            }
-                            _ => { panic!("prewrite return but process result is not result set."); }
-                        }
-                    }
-                    Err(e) => Err(e.into())
-                });
-            }
-            Command::Commit { ref mut callback, .. } => {
-                callback.take().unwrap()(result.map_err(::storage::Error::from));
-            }
-            Command::CommitThenGet { ref mut callback, .. } => {
-                callback.take().unwrap()( match result {
-                    Ok(()) => {
-                        match pr {
-                            ProcessResult::Value { value } => { Ok(value) }
-                            _ => { panic!("commit then get return but process result is not value."); }
-                        }
-                    }
-                    Err(e) => {
-                        Err(::storage::Error::from(e))
-                    }
-                });
-            }
-            Command::Cleanup { ref mut callback, .. } => {
-                callback.take().unwrap()(result.map_err(::storage::Error::from));
-            }
-            Command::Rollback { ref mut callback, .. } => {
-                callback.take().unwrap()(result.map_err(::storage::Error::from));
-            }
-            Command::RollbackThenGet { ref mut callback, .. } => {
-                callback.take().unwrap()( match result {
-                    Ok(()) => {
-                        match pr {
-                            ProcessResult::Value { value } => { Ok(value) }
-                            _ => { panic!("rollback then get return but process result is not value."); }
-                        }
-                    }
-                    Err(e) => {
-                        Err(::storage::Error::from(e))
-                    }
-                });
-            }
-            _ => { panic!("unsupported write cmd"); }
-        }
-    }
-
     fn process_failed_cmd(&mut self, cid: u64, err: Error) {
         let rctx = self.cmd_ctxs.get_mut(&cid).unwrap();
 
@@ -487,6 +439,196 @@ impl Scheduler {
 
         self.register_report_tick(event_loop);
     }
+
+    fn received_new_cmd(&mut self, cmd: Command) {
+        let cid = self.next_id();
+        debug!("receive new cmd, cid = {}", cid);
+
+        self.incr_running_cmd();
+
+        if readonly_cmd(&cmd) {
+            // readonly command don't need lock, step to GetSnapshot
+            let ctx: RunningCtx = RunningCtx::new(cid, cmd, vec![]);
+            self.save_cmd_context(cid, ctx);
+
+            if let Err(e) = self.schedch.send(Msg::GetSnapshot{ cid: cid }) {
+                error!("send msg getsnapshot failed, cid = {}, error = {:?}", cid, e);
+                self.process_failed_cmd(cid, e);
+                self.finish_cmd(cid);
+            }
+
+        } else {
+            // write command need acquire row lock first
+            // if acquire all locks then get snapshot, or this command
+            // will be wake up by who owned lock after release lock
+            let lock_idxs = self.calc_lock_indexs(&cmd);
+            let mut ctx: RunningCtx = RunningCtx::new(cid, cmd, lock_idxs);
+
+            let acquire_count = self.rowlocks.acquire_by_indexs(ctx.needed_locks(), cid);
+            ctx.owned_lock_count += acquire_count;
+
+            if ctx.all_lock_acquired() {
+                if let Err(e) = self.schedch.send(Msg::GetSnapshot { cid: cid }) {
+                    error!("send msg getsnapshot failed, cid = {}, error = {:?}", cid, e);
+                    self.process_failed_cmd(cid, e);
+                    self.finish_cmd(cid);
+                }
+            }
+
+            self.save_cmd_context(cid, ctx);
+        }
+    }
+
+    fn acquire_lock_for_cmd(&mut self, cid: u64) {
+        debug!("receive acquire lock msg for cid = {}", cid);
+
+        let mut all_lock_acquired = false;
+        {
+            let ref mut ctx = self.cmd_ctxs.get_mut(&cid).unwrap();
+
+            let new_acquired = {
+                let needed_locks = ctx.needed_locks();
+                let owned_count = ctx.owned_lock_count;
+                self.rowlocks.acquire_by_indexs(&needed_locks[owned_count..], cid)
+            };
+            ctx.owned_lock_count += new_acquired;
+            if ctx.all_lock_acquired() {
+                all_lock_acquired = true;
+            }
+        }
+
+        if all_lock_acquired {
+            if let Err(e) = self.schedch.send(Msg::GetSnapshot{ cid: cid }) {
+                error!("send msg getsnapshot failed, cid = {}, error = {:?}", cid, e);
+                self.process_failed_cmd(cid, e);
+                self.finish_cmd(cid);
+            }
+        }
+    }
+
+    fn get_snapshot_for_cmd(&mut self, cid: u64) {
+        debug!("receive get snapshot msg for cid = {}", cid);
+
+        let ch = self.schedch.clone();
+        let cb = box move |snapshot: EngineResult<Box<Snapshot>>| {
+            if let Err(e) = ch.send(Msg::SnapshotFinish{
+                cid: cid,
+                snapshot: snapshot,
+            }) {
+                error!("send GotSnap failed cmd id {}, err {:?}",
+                cid,
+                e);
+            }
+        };
+
+        match self.engine.async_snapshot(self.extract_cmd_context_by_id(cid), cb) {
+            Ok(()) => { }
+            Err(e) => {
+                self.process_failed_cmd(cid, Error::from(e));
+                self.finish_cmd(cid);
+            }
+        }
+    }
+
+    fn snapshot_finished_for_cmd(&mut self, cid: u64, snapshot: EngineResult<Box<Snapshot>>) {
+        debug!("receive snapshot finish msg for cid = {}", cid);
+
+        match snapshot {
+            Ok(snapshot) => {
+                let res = self.process_cmd_with_snapshot(cid, snapshot.as_ref());
+                let mut finished: bool = false;
+                match res {
+                    Ok(()) => {
+                        let rctx = self.cmd_ctxs.get(&cid).unwrap();
+
+                        if readonly_cmd(&rctx.cmd) {
+                            finished = true;
+                        }
+                    }
+                    Err(e) => {
+                        self.process_failed_cmd(cid, Error::from(e));
+                        finished = true;
+                    }
+                }
+
+                if finished {
+                    self.finish_cmd(cid);
+                }
+            }
+            Err(e) => {
+                self.process_failed_cmd(cid, Error::from(e));
+                self.finish_cmd(cid);
+            }
+        }
+    }
+
+    fn write_finished_for_cmd(&mut self, cid: u64, pr: ProcessResult, result: EngineResult<()>) {
+        debug!("receive write finish msg for cid = {}", cid);
+
+        {
+            let rctx = self.cmd_ctxs.get_mut(&cid).unwrap();
+
+            assert_eq!(cid, rctx.cid);
+            match rctx.cmd {
+                Command::Prewrite { ref mut callback, .. } => {
+                    callback.take().unwrap()(match result {
+                        Ok(()) => {
+                            match pr {
+                                ProcessResult::ResultSet { mut result } => {
+                                    Ok(result.drain(..).map(|x| x.map_err(::storage::Error::from)).collect())
+                                }
+                                _ => { panic!("prewrite return but process result is not result set."); }
+                            }
+                        }
+                        Err(e) => Err(e.into())
+                    });
+                }
+                Command::Commit { ref mut callback, .. } => {
+                    callback.take().unwrap()(result.map_err(::storage::Error::from));
+                }
+                Command::CommitThenGet { ref mut callback, .. } => {
+                    callback.take().unwrap()(match result {
+                        Ok(()) => {
+                            match pr {
+                                ProcessResult::Value { value } => { Ok(value) }
+                                _ => { panic!("commit then get return but process result is not value."); }
+                            }
+                        }
+                        Err(e) => {
+                            Err(::storage::Error::from(e))
+                        }
+                    });
+                }
+                Command::Cleanup { ref mut callback, .. } => {
+                    callback.take().unwrap()(result.map_err(::storage::Error::from));
+                }
+                Command::Rollback { ref mut callback, .. } => {
+                    callback.take().unwrap()(result.map_err(::storage::Error::from));
+                }
+                Command::RollbackThenGet { ref mut callback, .. } => {
+                    callback.take().unwrap()(match result {
+                        Ok(()) => {
+                            match pr {
+                                ProcessResult::Value { value } => { Ok(value) }
+                                _ => { panic!("rollback then get return but process result is not value."); }
+                            }
+                        }
+                        Err(e) => {
+                            Err(::storage::Error::from(e))
+                        }
+                    });
+                }
+                _ => { panic!("unsupported write cmd"); }
+            }
+        }
+
+        self.finish_cmd(cid);
+    }
+
+    fn shutdown(&mut self, event_loop: &mut EventLoop<Self>) {
+        info!("receive shutdown command");
+        event_loop.shutdown();
+    }
 }
 
 fn register_timer(event_loop: &mut EventLoop<Scheduler>,
@@ -512,139 +654,15 @@ impl mio::Handler for Scheduler {
 
     fn notify(&mut self, event_loop: &mut EventLoop<Self>, msg: Msg) {
         match msg {
-            Msg::Quit => {
-                info!("receive quit message");
-                event_loop.shutdown();
-            }
+            // message from outer
+            Msg::Quit => self.shutdown(event_loop),
+            Msg::CMD { cmd } => self.received_new_cmd(cmd),
 
-            Msg::CMD { cmd } => {
-                self.running_cmd_count += 1;
-
-                // save cmd context and step forward
-                let cid = self.next_id();
-                debug!("receive cmd, cid = {}", cid);
-
-                if readonly_cmd(&cmd) {
-                    // readonly command don't need lock, step to GetSnapshot
-                    let ctx: RunningCtx = RunningCtx::new(cid, cmd, vec![]);
-                    self.save_cmd_context(cid, ctx);
-
-                    if let Err(e) = self.schedch.send(Msg::GetSnapshot{ cid: cid }) {
-                        error!("send msg getsnapshot failed, cid = {}, error = {:?}", cid, e);
-                        self.process_failed_cmd(cid, e);
-                        self.finish_cmd(cid);
-                    }
-
-                } else {
-                    // write command need acquire row lock first
-                    // if acquire all locks then get snapshot, or this command
-                    // will be wake up by who owned lock after release lock
-                    let lock_idxs = self.calc_lock_indexs(&cmd);
-                    let mut ctx: RunningCtx = RunningCtx::new(cid, cmd, lock_idxs);
-
-                    let acquire_count = self.rowlocks.acquire_by_indexs(ctx.needed_locks(), cid);
-                    ctx.owned_lock_count += acquire_count;
-
-                    if ctx.all_lock_acquired() {
-                        if let Err(e) = self.schedch.send(Msg::GetSnapshot { cid: cid }) {
-                            error!("send msg getsnapshot failed, cid = {}, error = {:?}", cid, e);
-                            self.process_failed_cmd(cid, e);
-                            self.finish_cmd(cid);
-                        }
-                    }
-
-                    self.save_cmd_context(cid, ctx);
-                }
-            }
-
-            Msg::AcquireLock { cid } => {
-                debug!("receive checklock msg for cid = {}", cid);
-
-                let mut all_lock_acquired = false;
-                {
-                    let ref mut ctx = self.cmd_ctxs.get_mut(&cid).unwrap();
-
-                    let new_acquired = {
-                        let needed_locks = ctx.needed_locks();
-                        let owned_count = ctx.owned_lock_count;
-                        self.rowlocks.acquire_by_indexs(&needed_locks[owned_count..], cid)
-                    };
-                    ctx.owned_lock_count += new_acquired;
-                    if ctx.all_lock_acquired() {
-                        all_lock_acquired = true;
-                    }
-                }
-
-                if all_lock_acquired {
-                    if let Err(e) = self.schedch.send(Msg::GetSnapshot{ cid: cid }) {
-                        error!("send msg getsnapshot failed, cid = {}, error = {:?}", cid, e);
-                        self.process_failed_cmd(cid, e);
-                        self.finish_cmd(cid);
-                    }
-                }
-            }
-
-            Msg::GetSnapshot { cid } => {
-                debug!("receive get snapshot msg for cid = {}", cid);
-
-                let ch = self.schedch.clone();
-                let cb = box move |snapshot: EngineResult<Box<Snapshot>>| {
-                    if let Err(e) = ch.send(Msg::SnapshotFinish{
-                        cid: cid,
-                        snapshot: snapshot,
-                    }) {
-                        error!("send GotSnap failed cmd id {}, err {:?}",
-                        cid,
-                        e);
-                    }
-                };
-
-                match self.engine.async_snapshot(self.extract_cmd_context_by_id(cid), cb) {
-                    Ok(()) => { }
-                    Err(e) => {
-                        self.process_failed_cmd(cid, Error::from(e));
-                        self.finish_cmd(cid);
-                    }
-                }
-            }
-
-            Msg::SnapshotFinish { cid, snapshot } => {
-                debug!("receive snapshot finish msg for cid = {}", cid);
-
-                match snapshot {
-                    Ok(snapshot) => {
-                        let res = self.process_cmd_with_snapshot(cid, snapshot.as_ref());
-                        let mut finished: bool = false;
-                        match res {
-                            Ok(()) => {
-                                let rctx = self.cmd_ctxs.get(&cid).unwrap();
-
-                                if readonly_cmd(&rctx.cmd) {
-                                    finished = true;
-                                }
-                            }
-                            Err(e) => {
-                                self.process_failed_cmd(cid, Error::from(e));
-                                finished = true;
-                            }
-                        }
-
-                        if finished {
-                            self.finish_cmd(cid);
-                        }
-                    }
-                    Err(e) => {
-                        self.process_failed_cmd(cid, Error::from(e));
-                        self.finish_cmd(cid);
-                    }
-                }
-            }
-
-            Msg::WriteFinish { cid, pr, result } => {
-                debug!("receive write finish msg for cid = {}", cid);
-                self.process_write_finish(cid, pr, result);
-                self.finish_cmd(cid);
-            }
+            // inner message
+            Msg::AcquireLock { cid } => self.acquire_lock_for_cmd(cid),
+            Msg::GetSnapshot { cid } => self.get_snapshot_for_cmd(cid),
+            Msg::SnapshotFinish { cid, snapshot } => self.snapshot_finished_for_cmd(cid, snapshot),
+            Msg::WriteFinish { cid, pr, result } => self.write_finished_for_cmd(cid, pr, result),
         }
     }
 
