@@ -249,10 +249,11 @@ impl Storage {
     }
 
     fn send(&self, cmd: Command) -> Result<()> {
-        match self.sched_handle {
-            Some(ref h) => try!(self.schedch.send(Msg::CMD{ cmd:cmd })),
-            None => return Err(Error::Closed),
-        };
+        if self.sched_handle.is_some() {
+            try!(self.schedch.send(Msg::CMD{ cmd:cmd }));
+        } else {
+            return Err(Error::Closed);
+        }
         Ok(())
     }
 
