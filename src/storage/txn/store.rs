@@ -62,7 +62,7 @@ pub struct StoreScanner<'a> {
 impl<'a> StoreScanner<'a> {
     pub fn seek(&mut self, mut key: Key) -> Result<Option<(Key, Value)>> {
         loop {
-            if !try!(self.cursor.seek(&key)) {
+            if !try!(self.cursor.near_seek(&key)) {
                 return Ok(None);
             }
             key = try!(Key::from_encoded(self.cursor.key().to_vec()).truncate_ts());
@@ -79,7 +79,7 @@ impl<'a> StoreScanner<'a> {
 
     pub fn reverse_seek(&mut self, mut key: Key) -> Result<Option<(Key, Value)>> {
         loop {
-            if !try!(self.cursor.reverse_seek(&key)) {
+            if !try!(self.cursor.near_reverse_seek(&key)) {
                 return Ok(None);
             }
             key = try!(Key::from_encoded(self.cursor.key().to_vec()).truncate_ts());
