@@ -295,6 +295,10 @@ impl Peer {
         self.get_store().get_region()
     }
 
+    pub fn region_id(&self) -> u64 {
+        self.region_id
+    }
+
     pub fn peer_id(&self) -> u64 {
         self.peer.get_id()
     }
@@ -345,10 +349,10 @@ impl Peer {
     }
 
     #[inline]
-    fn send<T>(&mut self, trans: &T, msgs: &[eraftpb::Message]) -> Result<()>
+    fn send<T>(&mut self, trans: &T, msgs: &mut Vec<eraftpb::Message>) -> Result<()>
         where T: Transport
     {
-        for msg in msgs {
+        for msg in msgs.drain(..) {
             try!(self.send_raft_message(msg, trans));
         }
         Ok(())
@@ -396,7 +400,7 @@ impl Peer {
         down_peers
     }
 
-    pub fn handle_raft_ready<T: Transport>(&mut self, trans: &T) -> Result<Option<ReadyResult>> {
+    pub fn maybe_ready<T: Transport>(&mut self, trans: &T) -> Result<Option<Ready>> {
         if !self.raft_group.has_ready() {
             return Ok(None);
         }
@@ -404,6 +408,29 @@ impl Peer {
         debug!("{} handle raft ready", self.tag);
 
         let mut ready = self.raft_group.ready();
+        self.send_ready_metric(&ready);
+        // The leader can write to disk and replicate to the followers concurrently
+        // For more details, check raft thesis 10.2.1
+        if self.is_leader() {
+            try!(self.send(trans, &mut ready.messages));
+        }
+
+        // Can we just ignore hardstate here?
+        if ready.entries.is_empty() && ready.hs.is_none() &&
+           (self.get_store().is_applying_snap() ||
+            ready.committed_entries.is_empty() && raft::is_empty_snap(&ready.snapshot)) {
+            try!(self.send(trans, &mut ready.messages));
+            self.raft_group.advance(ready);
+            Ok(None)
+        } else {
+            Ok(Some(ready))
+        }
+    }
+
+    pub fn handle_raft_ready<T: Transport>(&mut self,
+                                           mut ready: Ready,
+                                           trans: &T)
+                                           -> Result<Option<ReadyResult>> {
         let is_applying = self.get_store().is_applying_snap();
         if is_applying {
             // skip apply and snapshot
@@ -413,19 +440,9 @@ impl Peer {
 
         let t = SlowTimer::new();
 
-        self.send_ready_metric(&ready);
-
-        // The leader can write to disk and replicate to the followers concurrently
-        // For more details, check raft thesis 10.2.1
-        if self.is_leader() {
-            try!(self.send(trans, &ready.messages));
-        }
-
         let apply_result = try!(self.mut_store().handle_raft_ready(&ready));
 
-        if !self.is_leader() {
-            try!(self.send(trans, &ready.messages));
-        }
+        try!(self.send(trans, &mut ready.messages));
 
         let exec_results = try!(self.handle_raft_commit_entries(&ready.committed_entries));
 
@@ -645,13 +662,7 @@ impl Peer {
         None
     }
 
-    fn send_raft_message<T: Transport>(&mut self, msg: &eraftpb::Message, trans: &T) -> Result<()> {
-        let mut send_msg = RaftMessage::new();
-        send_msg.set_region_id(self.region_id);
-        // TODO: can we use move instead?
-        send_msg.set_message(msg.clone());
-        // set current epoch
-        send_msg.set_region_epoch(self.region().get_region_epoch().clone());
+    fn send_raft_message<T: Transport>(&mut self, msg: eraftpb::Message, trans: &T) -> Result<()> {
         let mut unreachable = false;
 
         let from_peer = match self.get_peer_from_cache(msg.get_from()) {
@@ -672,13 +683,19 @@ impl Peer {
             }
         };
 
+        let mut send_msg = RaftMessage::new();
+        send_msg.set_region_id(self.region_id);
+        send_msg.set_message(msg);
+        // set current epoch
+        send_msg.set_region_epoch(self.region().get_region_epoch().clone());
+
         let to_peer_id = to_peer.get_id();
         let to_store_id = to_peer.get_store_id();
-        let msg_type = msg.get_msg_type();
+        let msg_type = send_msg.get_message().get_msg_type();
         debug!("{} send raft msg {:?}[size: {}] from {} to {}",
                self.tag,
                msg_type,
-               msg.compute_size(),
+               send_msg.get_message().compute_size(),
                from_peer.get_id(),
                to_peer_id);
 
