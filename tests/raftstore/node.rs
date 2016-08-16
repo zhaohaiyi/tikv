@@ -13,10 +13,12 @@
 
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::fs;
+use std::thread;
+use std::sync::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rocksdb::DB;
 use tempdir::TempDir;
@@ -44,16 +46,102 @@ pub struct ChannelTransportCore {
 
 #[derive(Clone)]
 pub struct ChannelTransport {
+    total_cnt: Arc<AtomicUsize>,
+    rl_cnt: Arc<AtomicUsize>,
+    wl_cnt: Arc<AtomicUsize>,
     core: Arc<RwLock<ChannelTransportCore>>,
+}
+
+pub struct ReadGuard<'a> {
+    id: Arc<AtomicUsize>,
+    guard: Option<RwLockReadGuard<'a, ChannelTransportCore>>,
+}
+
+impl<'a> Drop for ReadGuard<'a> {
+    fn drop(&mut self) {
+        drop(self.guard.take().unwrap());
+        self.id.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl<'a> Deref for ReadGuard<'a> {
+    type Target = RwLockReadGuard<'a, ChannelTransportCore>;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().unwrap()
+    }
+}
+
+pub struct WriteGuard<'a> {
+    id: Arc<AtomicUsize>,
+    guard: Option<RwLockWriteGuard<'a, ChannelTransportCore>>,
+}
+
+impl<'a> Drop for WriteGuard<'a> {
+    fn drop(&mut self) {
+        drop(self.guard.take().unwrap());
+        self.id.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl<'a> Deref for WriteGuard<'a> {
+    type Target = RwLockWriteGuard<'a, ChannelTransportCore>;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_ref().unwrap()
+    }
+}
+
+impl<'a> DerefMut for WriteGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard.as_mut().unwrap()
+    }
 }
 
 impl ChannelTransport {
     pub fn new() -> ChannelTransport {
         ChannelTransport {
+            total_cnt: Arc::new(AtomicUsize::new(0)),
+            rl_cnt: Arc::new(AtomicUsize::new(0)),
+            wl_cnt: Arc::new(AtomicUsize::new(0)),
             core: Arc::new(RwLock::new(ChannelTransportCore {
                 snap_paths: HashMap::new(),
                 routers: HashMap::new(),
             })),
+        }
+    }
+
+    pub fn rl(&self) -> ReadGuard {
+        self.total_cnt.fetch_add(1, Ordering::SeqCst);
+        self.rl_cnt.fetch_add(1, Ordering::SeqCst);
+        let wl_cnt = self.wl_cnt.load(Ordering::SeqCst);
+        if wl_cnt > 0 {
+            let rl_cnt = self.rl_cnt.load(Ordering::SeqCst);
+            println!("borrow {}, {}", rl_cnt, wl_cnt);
+        }
+        ReadGuard {
+            id: self.rl_cnt.clone(),
+            guard: Some(self.core.rl())
+        }
+    }
+
+    pub fn wl(&self) -> WriteGuard {
+        self.wl_cnt.fetch_add(1, Ordering::SeqCst) + 1;
+        loop {
+            let total_cnt = self.total_cnt.load(Ordering::SeqCst);
+            let rl_cnt = self.rl_cnt.load(Ordering::SeqCst);
+            let wl_cnt = self.wl_cnt.load(Ordering::SeqCst);
+            println!("total_cnt -> {}, rl_cnt -> {}, wl_cnt -> {}", total_cnt, rl_cnt, wl_cnt);
+            match self.core.try_write() {
+                Ok(w) => return WriteGuard {
+                    id: self.wl_cnt.clone(),
+                    guard: Some(w),
+                },
+                Err(e) => {
+                    println!("{:?}", e);
+                    thread::sleep_ms(1000)
+                }
+            }
         }
     }
 }
