@@ -20,12 +20,14 @@ use std::net::{ToSocketAddrs, TcpStream, SocketAddr};
 use std::time::{Duration, Instant};
 use std::collections::hash_map::Entry;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use nix::sys::signal::{SIGUSR1, SIGHUP};
 
 use time;
 use rand::{self, ThreadRng};
 use protobuf::Message;
 use prometheus::{self, Encoder, TextEncoder};
 use log::{self, Log, LogMetadata, LogRecord, SetLoggerError};
+use signal::trap::Trap;
 
 #[macro_use]
 pub mod macros;
@@ -395,6 +397,7 @@ pub fn run_prometheus(interval: Duration) -> Option<thread::JoinHandle<()>> {
     Some(thread::spawn(move || {
         let encoder = TextEncoder::new();
         let mut buffer = Vec::<u8>::new();
+        let trap = Trap::trap(&[SIGUSR1, SIGHUP]);
         loop {
             let metric_familys = prometheus::gather();
             encoder.encode(&metric_familys, &mut buffer).unwrap();

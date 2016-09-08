@@ -57,6 +57,8 @@ extern crate prometheus;
 #[macro_use]
 extern crate lazy_static;
 
+extern crate signal;
+
 #[macro_use]
 pub mod util;
 pub mod raft;

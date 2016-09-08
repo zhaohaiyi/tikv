@@ -46,9 +46,10 @@ rustc-serialize = "0.3"
 protobuf = "1.0"
 bytes  = "0.3.0"
 nix = "0.6.0"
-utime = "0.1"
 chrono = "0.2"
 lazy_static = "0.2.1"
+signal = "0.2.0"
+
 
 # The getopts in crate.io is outdated, use the latest getopts instead.
 [dependencies.getopts]
@@ -68,6 +69,10 @@ git = "https://github.com/carllerche/mio.git"
 
 [dependencies.prometheus]
 git = "https://github.com/pingcap/rust-prometheus"
+
+
+[dependencies.utime]
+git = "https://github.com/ngaut/utime.git"
 
 [profile.dev]
 opt-level = 0  # Controls the --opt-level the compiler builds with
