@@ -404,7 +404,10 @@ impl Peer {
         down_peers
     }
 
-    pub fn handle_raft_ready<T: Transport>(&mut self, trans: &T) -> Result<Option<ReadyResult>> {
+    pub fn handle_raft_ready<T: Transport>(&mut self,
+                                           trans: &T,
+                                           pending_groups: &mut HashSet<u64>)
+                                           -> Result<Option<ReadyResult>> {
         if !self.raft_group.has_ready() {
             return Ok(None);
         }
@@ -442,7 +445,11 @@ impl Peer {
             try!(self.send(trans, &ready.messages));
         }
 
-        let exec_results = try!(self.handle_raft_commit_entries(&ready.committed_entries));
+        let (still_pending, exec_results) =
+            try!(self.handle_raft_commit_entries(&ready.committed_entries));
+        if still_pending {
+            pending_groups.insert(self.region_id);
+        }
 
         slow_log!(t,
                   "{} handle ready, entries {}, committed entries {}, messages \
@@ -768,7 +775,7 @@ impl Peer {
 
     fn handle_raft_commit_entries(&mut self,
                                   committed_entries: &[eraftpb::Entry])
-                                  -> Result<Vec<ExecResult>> {
+                                  -> Result<(bool, Vec<ExecResult>)> {
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
         // the others will be saved as a normal entry with no data, so we must re-propose these
         // commands again.
@@ -776,6 +783,7 @@ impl Peer {
         let mut results = vec![];
         let committed_count = committed_entries.len();
         let mut term = 0u64;
+        let mut still_pending = false;
         let mut wb = WriteBatch::new();
         let mut post_apply: Vec<(Callback, RaftCmdRequest, RaftCmdResponse)> =
             Vec::with_capacity(committed_count);
@@ -795,6 +803,7 @@ impl Peer {
                 term = entry.get_term();
             } else if entry.get_term() != term {
                 PEER_COMMIT_ENTRIES_TERM_NOT_EQUAL_COUNTER.inc();
+                still_pending = true;
                 break;
             }
 
@@ -831,7 +840,7 @@ impl Peer {
                   "{} handle {} committed entries",
                   self.tag,
                   committed_count);
-        Ok(results)
+        Ok((still_pending, results))
     }
 
     fn handle_raft_entry_normal(&mut self,

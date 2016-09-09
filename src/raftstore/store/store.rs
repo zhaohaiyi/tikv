@@ -575,7 +575,7 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         for region_id in ids {
             let mut ready_result = None;
             if let Some(peer) = self.region_peers.get_mut(&region_id) {
-                match peer.handle_raft_ready(&self.trans) {
+                match peer.handle_raft_ready(&self.trans, &mut self.pending_raft_groups) {
                     Err(e) => {
                         // TODO: should we panic or shutdown the store?
                         error!("{} handle raft ready err: {:?}", peer.tag, e);
