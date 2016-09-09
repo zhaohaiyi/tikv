@@ -404,10 +404,7 @@ impl Peer {
         down_peers
     }
 
-    pub fn handle_raft_ready<T: Transport>(&mut self,
-                                           trans: &T,
-                                           wb: &mut WriteBatch)
-                                           -> Result<Option<ReadyResult>> {
+    pub fn handle_raft_ready<T: Transport>(&mut self, trans: &T) -> Result<Option<ReadyResult>> {
         if !self.raft_group.has_ready() {
             return Ok(None);
         }
@@ -445,8 +442,7 @@ impl Peer {
             try!(self.send(trans, &ready.messages));
         }
 
-        let (apply_index, exec_results) =
-            try!(self.handle_raft_commit_entries(&ready.committed_entries, wb));
+        let exec_results = try!(self.handle_raft_commit_entries(&ready.committed_entries));
 
         slow_log!(t,
                   "{} handle ready, entries {}, committed entries {}, messages \
@@ -461,10 +457,8 @@ impl Peer {
         if is_applying {
             // Remove the hard state so Raft won't change the apply index.
             ready.hs.take();
-        } else if apply_index != 0 {
-            if let Some(ref mut hs) = ready.hs {
-                hs.set_commit(apply_index);
-            }
+        } else if let Some(ref mut hs) = ready.hs {
+            hs.set_commit(self.get_store().apply_state.get_applied_index());
         }
 
         self.raft_group.advance(ready);
@@ -773,55 +767,43 @@ impl Peer {
     }
 
     fn handle_raft_commit_entries(&mut self,
-                                  committed_entries: &[eraftpb::Entry],
-                                  wb: &mut WriteBatch)
-                                  -> Result<(u64, Vec<ExecResult>)> {
+                                  committed_entries: &[eraftpb::Entry])
+                                  -> Result<Vec<ExecResult>> {
         // If we send multiple ConfChange commands, only first one will be proposed correctly,
         // the others will be saved as a normal entry with no data, so we must re-propose these
         // commands again.
         let t = SlowTimer::new();
         let mut results = vec![];
         let committed_count = committed_entries.len();
-        let mut apply_index = 0u64;
         let mut term = 0u64;
+        let mut wb = WriteBatch::new();
+        let mut post_apply: Vec<(Callback, RaftCmdRequest, RaftCmdResponse)> =
+            Vec::with_capacity(committed_count);
         for entry in committed_entries {
-            // The callback is called before writing apply_wb to the engine to improve the
-            // performance. Entries with different terms need to be applied in different
-            // on_raft_ready rounds. For more details, see the following example:
+            // Entries with different terms need to be applied in different on_raft_ready
+            // rounds. For more details, see the following example:
             //
-            //   The raft group A consists of three nodes: Node 1, Node 2, and Node 3.
-            //   Node 1 is the leader at the beginning. If there is no leader transfer,
-            //   the process is:
-            //    1. Node 1 applies the put command on the "a" key.
-            //    2. Node 1 sends a response to a client (call cb).
-            //    3. The client raises a get "a" command.
-            //    4. Node 1 returns the value ("a") from the put command to the client.
-            //   The client can get the value from the put command because the get command
-            //   is run after store.on_raft_ready is finished.
-            //
-            //   However, if the leader is
-            //   transferred from Node 1 to Node 2, the process is:
-            //    1. Node 1 applies the put command on the "a" key.
-            //    2. Node 1 sends a response to a client (call cb).
-            //    3. The client sends a get command to the new leader (Node 2).
-            //    4. The get command uses Raft read because of the leader transfer.
-            //   In this case, the put command and the get command from the client may be applied
-            //   in the same on_raft_ready round on Node 2. Because the "a" value from the put
-            //   command is not written to the engine, the get command cannot get the value ("a").
-            //   So the put command and get command must be applied in different on_raft_ready
-            //   rounds.
+            // A raft group consists of three nodes: Node 1, Node 2, and Node 3. Assuming Node 1
+            // is the leader at the beginning. The client propose a put command on the "a" key,
+            // Node 1 will response to the client after the put command has applied on Node 1,
+            // at this moment the put command may not has applied on Node 2, if the leader transfer
+            // from Node 1 to Node 2 and the client raises a get "a" command, the get command
+            // may be applied in the same on_raft_ready round with the previous put command on
+            // Node 2, the get command cannot get the value("a"). So the put command and get
+            // command must be applied in different on_raft_ready rounds.
             if term == 0 {
                 term = entry.get_term();
             } else if entry.get_term() != term {
                 PEER_COMMIT_ENTRIES_TERM_NOT_EQUAL_COUNTER.inc();
                 break;
             }
-            apply_index = entry.get_index();
 
             let res = try!(match entry.get_entry_type() {
-                eraftpb::EntryType::EntryNormal => self.handle_raft_entry_normal(entry, wb),
+                eraftpb::EntryType::EntryNormal => {
+                    self.handle_raft_entry_normal(entry, &mut wb, &mut post_apply)
+                }
                 eraftpb::EntryType::EntryConfChange => {
-                    self.handle_raft_entry_conf_change(entry, wb)
+                    self.handle_raft_entry_conf_change(entry, &mut wb, &mut post_apply)
                 }
             });
 
@@ -830,16 +812,31 @@ impl Peer {
             }
         }
 
+        if !wb.is_empty() {
+            if let Err(e) = self.engine.write(wb) {
+                panic!("write apply write batch failed, err {:?}", e);
+            }
+        }
+
+        for (cb, cmd, mut resp) in post_apply.drain(..) {
+            self.coprocessor_host.post_apply(self.raft_group.get_store(), &cmd, &mut resp);
+
+            if let Err(e) = cb.call_box((resp,)) {
+                error!("{} callback err {:?}", self.tag, e);
+            }
+        }
+
         slow_log!(t,
                   "{} handle {} committed entries",
                   self.tag,
                   committed_count);
-        Ok((apply_index, results))
+        Ok(results)
     }
 
     fn handle_raft_entry_normal(&mut self,
                                 entry: &eraftpb::Entry,
-                                wb: &mut WriteBatch)
+                                wb: &mut WriteBatch,
+                                post_apply: &mut Vec<(Callback, RaftCmdRequest, RaftCmdResponse)>)
                                 -> Result<Option<ExecResult>> {
         let index = entry.get_index();
         let term = entry.get_term();
@@ -859,7 +856,7 @@ impl Peer {
 
         let cmd = try!(protobuf::parse_from_bytes::<RaftCmdRequest>(data));
         // there is no need to return error here.
-        self.process_raft_cmd(index, term, cmd, wb).or_else(|e| {
+        self.process_raft_cmd(index, term, cmd, wb, post_apply).or_else(|e| {
             error!("{} process raft command at index {} err: {:?}",
                    self.tag,
                    index,
@@ -870,14 +867,17 @@ impl Peer {
 
     fn handle_raft_entry_conf_change(&mut self,
                                      entry: &eraftpb::Entry,
-                                     wb: &mut WriteBatch)
+                                     wb: &mut WriteBatch,
+                                     post_apply: &mut Vec<(Callback,
+                                                           RaftCmdRequest,
+                                                           RaftCmdResponse)>)
                                      -> Result<Option<ExecResult>> {
         let index = entry.get_index();
         let term = entry.get_term();
         let mut conf_change =
             try!(protobuf::parse_from_bytes::<eraftpb::ConfChange>(entry.get_data()));
         let cmd = try!(protobuf::parse_from_bytes::<RaftCmdRequest>(conf_change.get_context()));
-        let res = match self.process_raft_cmd(index, term, cmd, wb) {
+        let res = match self.process_raft_cmd(index, term, cmd, wb, post_apply) {
             a @ Ok(Some(_)) => a,
             e => {
                 error!("{} process raft command at index {} err: {:?}",
@@ -923,7 +923,8 @@ impl Peer {
                         index: u64,
                         term: u64,
                         cmd: RaftCmdRequest,
-                        wb: &mut WriteBatch)
+                        wb: &mut WriteBatch,
+                        post_apply: &mut Vec<(Callback, RaftCmdRequest, RaftCmdResponse)>)
                         -> Result<Option<ExecResult>> {
         if index == 0 {
             return Err(box_err!("processing raft command needs a none zero index"));
@@ -946,16 +947,13 @@ impl Peer {
             return Ok(exec_result);
         }
 
-        let cb = cb.unwrap();
-        self.coprocessor_host.post_apply(self.raft_group.get_store(), &cmd, &mut resp);
         // TODO: if we have exec_result, maybe we should return this callback too. Outer
         // store will call it after handing exec result.
         // Bind uuid here.
         cmd_resp::bind_uuid(&mut resp, uuid);
         cmd_resp::bind_term(&mut resp, self.term());
-        if let Err(e) = cb.call_box((resp,)) {
-            error!("{} callback err {:?}", self.tag, e);
-        }
+
+        post_apply.push((cb.unwrap(), cmd, resp));
 
         Ok(exec_result)
     }

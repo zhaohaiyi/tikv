@@ -572,32 +572,20 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         let ids: Vec<u64> = self.pending_raft_groups.drain().collect();
         let pending_count = ids.len();
 
-        let mut wb = WriteBatch::new();
-        let mut results: Vec<(u64, Option<ReadyResult>)> = Vec::with_capacity(ids.len());
         for region_id in ids {
+            let mut ready_result = None;
             if let Some(peer) = self.region_peers.get_mut(&region_id) {
-                match peer.handle_raft_ready(&self.trans, &mut wb) {
+                match peer.handle_raft_ready(&self.trans) {
                     Err(e) => {
-                        panic!("{} handle raft ready err: {:?}", peer.tag, e);
+                        // TODO: should we panic or shutdown the store?
+                        error!("{} handle raft ready err: {:?}", peer.tag, e);
+                        return Err(e);
                     }
-                    Ok(ready) => {
-                        results.push((region_id, ready));
-                    }
+                    Ok(ready) => ready_result = ready,
                 }
             }
-        }
 
-        // Batch write to engine, the write must success or panic.
-        if !wb.is_empty() {
-            STORE_ENGINE_WRITE_COUNTER.inc();
-            if let Err(e) = self.engine.write(wb) {
-                panic!("write apply write batch failed, err {:?}", e);
-            }
-        }
-
-        // handle the results.
-        for (region_id, result) in results.drain(..) {
-            if let Some(ready_result) = result {
+            if let Some(ready_result) = ready_result {
                 if let Err(e) = self.on_ready_result(region_id, ready_result) {
                     error!("[region {}] handle raft ready result err: {:?}",
                            region_id,
