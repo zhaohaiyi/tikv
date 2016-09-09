@@ -22,7 +22,7 @@ use std::collections::Bound::{Excluded, Unbounded};
 use std::time::{Duration, Instant};
 use std::{cmp, u64};
 
-use rocksdb::{DB, WriteBatch};
+use rocksdb::DB;
 use mio::{self, EventLoop, EventLoopBuilder, Sender};
 use protobuf;
 use uuid::Uuid;
