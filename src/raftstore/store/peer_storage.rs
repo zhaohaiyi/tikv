@@ -585,7 +585,7 @@ impl PeerStorage {
         if !ctx.wb.is_empty() {
             let mut opt = WriteOptions::new();
             opt.set_sync(true);
-            try!(self.engine.write_opt(ctx.wb, opt));
+            try!(self.engine.write_opt(ctx.wb, &opt));
         }
 
         self.raft_state = ctx.raft_state;

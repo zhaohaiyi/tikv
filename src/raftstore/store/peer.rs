@@ -19,7 +19,7 @@ use std::vec::Vec;
 use std::default::Default;
 use std::time::{Instant, Duration};
 
-use rocksdb::{DB, WriteBatch, Writable};
+use rocksdb::{DB, WriteBatch, Writable, WriteOptions};
 use protobuf::{self, Message};
 use uuid::Uuid;
 
@@ -843,12 +843,14 @@ impl Peer {
         if data.is_empty() {
             // when a peer become leader, it will send an empty entry.
             let wb = WriteBatch::new();
+            let mut opt = WriteOptions::new();
+            opt.set_sync(true);
             let mut state = self.get_store().apply_state.clone();
             state.set_applied_index(index);
             let engine = self.engine.clone();
             let raft_cf = try!(rocksdb::get_cf_handle(engine.as_ref(), CF_RAFT));
             try!(wb.put_msg_cf(*raft_cf, &keys::apply_state_key(self.region_id), &state));
-            try!(self.engine.write(wb));
+            try!(self.engine.write_opt(wb, &opt));
             self.mut_store().apply_state = state;
             self.mut_store().applied_index_term = term;
             return Ok(None);
@@ -996,7 +998,9 @@ impl Peer {
 
         // Commit write and change storage fields atomically.
         let mut storage = self.mut_store();
-        match storage.engine.write(ctx.wb) {
+        let mut opt = WriteOptions::new();
+        opt.set_sync(true);
+        match storage.engine.write_opt(ctx.wb, &opt) {
             Ok(_) => {
                 storage.apply_state = ctx.apply_state;
                 storage.applied_index_term = term;
