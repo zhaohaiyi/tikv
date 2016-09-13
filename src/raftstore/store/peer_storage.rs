@@ -175,6 +175,11 @@ impl PeerStorage {
                 }
             };
 
+        info!("{} start with raft state {:?}, apply state {:?}",
+              tag,
+              raft_state,
+              apply_state);
+
         Ok(PeerStorage {
             engine: engine,
             region: region.clone(),
@@ -575,10 +580,18 @@ impl PeerStorage {
         }
 
         if ctx.raft_state != self.raft_state {
+            debug!("{} raft state changed from {:?} to {:?}",
+                   self.tag,
+                   self.raft_state,
+                   ctx.raft_state);
             try!(ctx.save_raft(region_id));
         }
 
         if ctx.apply_state != self.apply_state {
+            debug!("{} apply state changed from {:?} to {:?}",
+                   self.tag,
+                   self.apply_state,
+                   ctx.apply_state);
             try!(ctx.save_apply(region_id));
         }
 
