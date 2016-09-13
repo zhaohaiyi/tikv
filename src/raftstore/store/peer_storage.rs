@@ -18,7 +18,7 @@ use std::error;
 use std::time::Instant;
 use std::mem;
 
-use rocksdb::{DB, WriteBatch, Writable};
+use rocksdb::{DB, WriteBatch, Writable, WriteOptions};
 use protobuf::Message;
 
 use kvproto::metapb;
@@ -583,7 +583,9 @@ impl PeerStorage {
         }
 
         if !ctx.wb.is_empty() {
-            try!(self.engine.write(ctx.wb));
+            let mut opt = WriteOptions::new();
+            opt.set_sync(true);
+            try!(self.engine.write_opt(ctx.wb, opt));
         }
 
         self.raft_state = ctx.raft_state;
