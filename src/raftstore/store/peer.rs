@@ -545,6 +545,10 @@ impl Peer {
                 (cmd_resp::new_error(e), None)
             });
 
+            debug!("{} propose local read with uuid {:?} successfully",
+                   self.tag,
+                   cmd.uuid);
+
             cmd_resp::bind_uuid(&mut resp, cmd.uuid);
             cmd_resp::bind_term(&mut resp, self.term());
             return cmd.cb.call_box((resp,));
@@ -553,6 +557,9 @@ impl Peer {
             let peer = transfer_leader.get_peer();
 
             if self.is_tranfer_leader_allowed(peer) {
+                debug!("{} propose transfer leader with uuid {:?} successfully",
+                       self.tag,
+                       cmd.uuid);
                 self.transfer_leader(peer);
             } else {
                 info!("{} transfer leader message {:?} ignored directly",
@@ -580,11 +587,17 @@ impl Peer {
                 return cmd.cb.call_box((err_resp,));
             }
 
+            debug!("{} propose configuration change with uuid {:?} successfully",
+                   self.tag,
+                   cmd.uuid);
             self.pending_cmds.set_conf_change(cmd);
         } else if let Err(e) = self.propose_normal(req) {
             cmd_resp::bind_error(&mut err_resp, e);
             return cmd.cb.call_box((err_resp,));
         } else {
+            debug!("{} propose normal command with uuid {:?} ok",
+                   self.tag,
+                   cmd.uuid);
             self.pending_cmds.append_normal(cmd);
         }
 
@@ -928,6 +941,11 @@ impl Peer {
 
         let uuid = util::get_uuid_from_req(&cmd).unwrap();
         let cb = self.find_cb(uuid, term, &cmd);
+        debug!("{} applying command with uuid {:?} at index {}",
+               self.tag,
+               uuid,
+               index);
+
         let (mut resp, exec_result) = self.apply_raft_cmd(index, term, &cmd).unwrap_or_else(|e| {
             error!("{} apply raft command err {:?}", self.tag, e);
             (cmd_resp::new_error(e), None)

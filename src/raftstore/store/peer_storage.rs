@@ -382,6 +382,13 @@ impl PeerStorage {
 
         let last_index = entries[entries.len() - 1].get_index();
 
+        if prev_last_index > last_index {
+            info!("{} deleting previous never committed log in [{}, {})",
+                  self.tag,
+                  last_index + 1,
+                  prev_last_index + 1);
+        }
+
         // Delete any previously appended log entries which never committed.
         for i in (last_index + 1)..(prev_last_index + 1) {
             try!(ctx.wb.delete_cf(*handle, &keys::raft_log_key(self.get_region_id(), i)));
