@@ -933,9 +933,10 @@ impl Peer {
             (cmd_resp::new_error(e), None)
         });
 
-        debug!("{} applied command with uuid {:?}: {:?}",
+        debug!("{} applied command with uuid {:?} at index {}: {:?}",
                self.tag,
                uuid,
+               index,
                resp.get_header());
 
         if cb.is_none() {
